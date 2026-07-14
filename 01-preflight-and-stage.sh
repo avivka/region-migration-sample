@@ -346,12 +346,30 @@ else
 fi
 
 # ──────────── 8. Recovery Services vault ────────────────────────
-if ! az backup vault show -g "$TARGET_RG" -n "$VAULT_NAME" &>/dev/null 2>&1; then
-    az backup vault create \
+# ASR requires a Recovery Services vault (Microsoft.RecoveryServices/vaults),
+# NOT a Backup vault (Microsoft.DataProtection/BackupVaults).
+# Use a DEDICATED vault — do NOT reuse an existing vault created for other
+# purposes (backup, different region, etc.) as it causes hangs and conflicts.
+if ! az resource show --resource-type "Microsoft.RecoveryServices/vaults" \
+        -g "$TARGET_RG" -n "$VAULT_NAME" &>/dev/null 2>&1; then
+    info "Creating Recovery Services vault $VAULT_NAME in $TARGET_REGION..."
+    az resource create \
+        --resource-type "Microsoft.RecoveryServices/vaults" \
         -g "$TARGET_RG" -n "$VAULT_NAME" -l "$TARGET_REGION" \
+        --properties '{}' \
+        --is-full-object false \
         -o none
     ok "Created Recovery Services vault $VAULT_NAME"
 else
+    # Verify vault is in the correct region
+    vault_location=$(az resource show --resource-type "Microsoft.RecoveryServices/vaults" \
+        -g "$TARGET_RG" -n "$VAULT_NAME" --query "location" -o tsv 2>/dev/null \
+        | tr '[:upper:]' '[:lower:]' | tr -d ' ')
+    expected_location=$(echo "$TARGET_REGION" | tr '[:upper:]' '[:lower:]' | tr -d ' ')
+    if [[ "$vault_location" != "$expected_location" ]]; then
+        warn "Vault $VAULT_NAME is in '$vault_location' but target region is '$expected_location'."
+        warn "ASR requires the vault to be in the target region. Create a new vault."
+    fi
     ok "Recovery Services vault $VAULT_NAME already exists"
 fi
 

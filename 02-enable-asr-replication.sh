@@ -23,6 +23,76 @@ warn()    { echo -e "${YELLOW}WARNING: $*${NC}" >&2; }
 detail()  { echo -e "${YELLOW}$*${NC}"; }
 err()     { echo -e "${RED}ERROR: $*${NC}" >&2; exit 1; }
 
+# ──────────────── az_sr timeout wrapper ─────────────
+_az=$(command -v az)
+AZ_SR_CMD_TIMEOUT=120       # max seconds for any single az_sr call
+ASR_OP_TIMEOUT=300           # 5 min for infra resources (policy, fabric, etc.)
+ASR_REPL_TIMEOUT=1800        # 30 min per VM replication enablement
+
+# Wrapper for az_sr that prevents indefinite hangs.
+# Runs the command in background and kills it if it exceeds AZ_SR_CMD_TIMEOUT.
+# Usage: az_sr <subcommand> [args...]   (omit the "site-recovery" prefix)
+az_sr() {
+    "$_az" site-recovery "$@" &
+    local pid=$!
+    local w=0
+    while (( w < AZ_SR_CMD_TIMEOUT )) && kill -0 "$pid" 2>/dev/null; do
+        sleep 1
+        w=$((w + 1))
+    done
+    if ! kill -0 "$pid" 2>/dev/null; then
+        local rc=0
+        wait "$pid" || rc=$?
+        return $rc
+    else
+        kill "$pid" 2>/dev/null
+        wait "$pid" 2>/dev/null || true
+        warn "az site-recovery command timed out after ${AZ_SR_CMD_TIMEOUT}s: $*"
+        return 124
+    fi
+}
+
+# Poll an ASR "show" command until the resource exists or timeout.
+# Each individual call goes through az_sr which enforces a per-call timeout.
+# Usage: wait_for_asr_resource <timeout_secs> <label> <az_sr show command ...>
+wait_for_asr_resource() {
+    local timeout_secs="$1"; shift
+    local label="$1"; shift
+    local elapsed=0
+
+    detail "  Waiting for $label to be provisioned (timeout: ${timeout_secs}s)..."
+    while (( elapsed < timeout_secs )); do
+        if "$@" &>/dev/null; then
+            return 0
+        fi
+        sleep 15
+        elapsed=$((elapsed + 15))
+    done
+    err "Timed out waiting for $label after ${timeout_secs}s"
+}
+
+# Wait for an ASR resource to reach a terminal provisioning state (Succeeded).
+# ASR resources can appear in "show" but not be fully ready (Creating/Updating).
+# Usage: wait_for_asr_provisioning <timeout_secs> <label> <az_sr show command ...>
+wait_for_asr_provisioning() {
+    local timeout_secs="$1"; shift
+    local label="$1"; shift
+    local elapsed=0
+
+    detail "  Waiting for $label to reach Succeeded state (timeout: ${timeout_secs}s)..."
+    while (( elapsed < timeout_secs )); do
+        local prov_state
+        prov_state=$("$@" --query "properties.customDetails.instanceType" -o tsv 2>/dev/null || echo "Unknown")
+        # Also check if the resource is queryable at all
+        if "$@" -o json 2>/dev/null | jq -e '.id' &>/dev/null; then
+            return 0
+        fi
+        sleep 15
+        elapsed=$((elapsed + 15))
+    done
+    err "Timed out waiting for $label provisioning after ${timeout_secs}s"
+}
+
 # ──────────────────────────── Usage ─────────────────────────────
 usage() {
     cat <<EOF
@@ -101,6 +171,27 @@ SUB_ID=$(az account show --query "id" -o tsv)
 
 info "== Phase 2: Enable ASR Replication =="
 
+# ──────────── 0. Validate vault ───────────────────────────────
+# Verify the vault is a Recovery Services vault in the target region.
+# Using a wrong vault type or vault in wrong region causes hangs and
+# CannotEnableProtection errors.
+info "Validating Recovery Services vault: $VAULT_NAME"
+if ! az resource show --resource-type "Microsoft.RecoveryServices/vaults" \
+        -g "$TARGET_RG" -n "$VAULT_NAME" &>/dev/null 2>&1; then
+    err "Vault '$VAULT_NAME' not found in resource group '$TARGET_RG'.
+  Make sure you ran 01-preflight-and-stage.sh first to create the vault.
+  Do NOT reuse an existing vault created for other purposes (backup, etc.)."
+fi
+vault_location=$(az resource show --resource-type "Microsoft.RecoveryServices/vaults" \
+    -g "$TARGET_RG" -n "$VAULT_NAME" --query "location" -o tsv 2>/dev/null \
+    | tr '[:upper:]' '[:lower:]' | tr -d ' ')
+expected_location=$(echo "$TARGET_REGION" | tr '[:upper:]' '[:lower:]' | tr -d ' ')
+if [[ "$vault_location" != "$expected_location" ]]; then
+    err "Vault '$VAULT_NAME' is in '$vault_location' but target region is '$expected_location'.
+  ASR requires the vault to be in the target region. Create a new vault."
+fi
+ok "Vault $VAULT_NAME verified (Recovery Services, $TARGET_REGION)"
+
 # ──────────── 1. Cache storage account (required for A2A) ─────
 if [[ -z "$CACHE_STORAGE_ACCT" ]]; then
     # Auto-generate a cache storage account name in the SOURCE region
@@ -125,27 +216,33 @@ CACHE_STORAGE_ID=$(az storage account show -g "$SOURCE_RG" -n "$CACHE_STORAGE_AC
 # ──────────── 2. Replication policy ───────────────────────────
 info "Creating replication policy: $POLICY_NAME"
 
-if az site-recovery policy show \
+if az_sr policy show \
     -g "$TARGET_RG" --vault-name "$VAULT_NAME" -n "$POLICY_NAME" &>/dev/null; then
     ok "Replication policy $POLICY_NAME already exists"
 else
-    az site-recovery policy create \
+    az_sr policy create \
         -g "$TARGET_RG" --vault-name "$VAULT_NAME" \
         -n "$POLICY_NAME" \
         --provider-specific-input '{a2a:{multi-vm-sync-status:Enable}}' \
-        --no-wait false
+        --no-wait
+    wait_for_asr_resource "$ASR_OP_TIMEOUT" "replication policy $POLICY_NAME" \
+        az_sr policy show -g "$TARGET_RG" --vault-name "$VAULT_NAME" -n "$POLICY_NAME"
     ok "Created replication policy: $POLICY_NAME"
 fi
 
-POLICY_ID=$(az site-recovery policy show \
+POLICY_ID=$(az_sr policy show \
     -g "$TARGET_RG" --vault-name "$VAULT_NAME" -n "$POLICY_NAME" \
     --query "id" -o tsv)
 
 # ──────────── 3. Source + target fabrics ──────────────────────
+# ASR "fabrics" are NOT Azure Service Fabric.  In ASR, a fabric is a logical
+# representation of a physical Azure region.  A2A replication requires exactly
+# two fabrics: one for the source region, one for the target region.  These are
+# mandatory ASR data-model objects — they cannot be skipped.
 SRC_FABRIC="fabric-${SOURCE_REGION}"
 TGT_FABRIC="fabric-${TARGET_REGION}"
 
-info "Creating ASR fabrics..."
+info "Creating ASR fabrics (logical region objects — required for A2A replication)..."
 
 for fabric_name in "$SRC_FABRIC" "$TGT_FABRIC"; do
     if [[ "$fabric_name" == "$SRC_FABRIC" ]]; then
@@ -154,15 +251,22 @@ for fabric_name in "$SRC_FABRIC" "$TGT_FABRIC"; do
         region="$TARGET_REGION"
     fi
 
-    if az site-recovery fabric show \
+    if az_sr fabric show \
         -g "$TARGET_RG" --vault-name "$VAULT_NAME" -n "$fabric_name" &>/dev/null; then
         ok "Fabric $fabric_name already exists"
     else
-        az site-recovery fabric create \
+        az_sr fabric create \
             -g "$TARGET_RG" --vault-name "$VAULT_NAME" \
             -n "$fabric_name" \
             --custom-details "{azure:{location:${region}}}" \
-            --no-wait false
+            --no-wait
+        wait_for_asr_resource "$ASR_OP_TIMEOUT" "fabric $fabric_name" \
+            az_sr fabric show -g "$TARGET_RG" --vault-name "$VAULT_NAME" -n "$fabric_name"
+        # Extra stabilization wait — ASR fabric provisioning is async and the
+        # resource can appear in "show" before it's fully ready for dependent
+        # operations (protection containers).  30s has proven reliable.
+        detail "  Stabilizing fabric $fabric_name..."
+        sleep 30
         ok "Created fabric: $fabric_name (region: $region)"
     fi
 done
@@ -180,22 +284,25 @@ for container_name in "$SRC_CONTAINER" "$TGT_CONTAINER"; do
         fabric="$TGT_FABRIC"
     fi
 
-    if az site-recovery protection-container show \
+    if az_sr protection-container show \
         -g "$TARGET_RG" --vault-name "$VAULT_NAME" \
         --fabric-name "$fabric" -n "$container_name" &>/dev/null; then
         ok "Container $container_name already exists"
     else
-        az site-recovery protection-container create \
+        az_sr protection-container create \
             -g "$TARGET_RG" --vault-name "$VAULT_NAME" \
             --fabric-name "$fabric" \
             -n "$container_name" \
             --provider-input '[{instance-type:A2A}]' \
-            --no-wait false
+            --no-wait
+        wait_for_asr_resource "$ASR_OP_TIMEOUT" "container $container_name" \
+            az_sr protection-container show -g "$TARGET_RG" --vault-name "$VAULT_NAME" \
+            --fabric-name "$fabric" -n "$container_name"
         ok "Created protection container: $container_name"
     fi
 done
 
-TGT_CONTAINER_ID=$(az site-recovery protection-container show \
+TGT_CONTAINER_ID=$(az_sr protection-container show \
     -g "$TARGET_RG" --vault-name "$VAULT_NAME" \
     --fabric-name "$TGT_FABRIC" -n "$TGT_CONTAINER" \
     --query "id" -o tsv)
@@ -205,13 +312,13 @@ MAPPING_NAME="mapping-${SOURCE_REGION}-to-${TARGET_REGION}"
 
 info "Creating container mapping..."
 
-if az site-recovery protection-container mapping show \
+if az_sr protection-container mapping show \
     -g "$TARGET_RG" --vault-name "$VAULT_NAME" \
     --fabric-name "$SRC_FABRIC" --protection-container "$SRC_CONTAINER" \
     -n "$MAPPING_NAME" &>/dev/null; then
     ok "Container mapping $MAPPING_NAME already exists"
 else
-    az site-recovery protection-container mapping create \
+    az_sr protection-container mapping create \
         -g "$TARGET_RG" --vault-name "$VAULT_NAME" \
         --fabric-name "$SRC_FABRIC" \
         --protection-container "$SRC_CONTAINER" \
@@ -219,7 +326,10 @@ else
         --policy-id "$POLICY_ID" \
         --target-container "$TGT_CONTAINER_ID" \
         --provider-input '{a2a:{agent-auto-update-status:Enabled}}' \
-        --no-wait false
+        --no-wait
+    wait_for_asr_resource "$ASR_OP_TIMEOUT" "container mapping $MAPPING_NAME" \
+        az_sr protection-container mapping show -g "$TARGET_RG" --vault-name "$VAULT_NAME" \
+        --fabric-name "$SRC_FABRIC" --protection-container "$SRC_CONTAINER" -n "$MAPPING_NAME"
     ok "Created container mapping: $MAPPING_NAME"
 fi
 
@@ -239,13 +349,13 @@ TARGET_VNET_ID=$(az network vnet show -g "$TARGET_RG" -n "$TARGET_VNET" --query 
 
 NET_MAPPING_NAME="netmap-${SOURCE_REGION}-to-${TARGET_REGION}"
 
-if az site-recovery network mapping show \
+if az_sr network mapping show \
     -g "$TARGET_RG" --vault-name "$VAULT_NAME" \
     --fabric-name "$SRC_FABRIC" --network-name "$SOURCE_VNET_NAME" \
     -n "$NET_MAPPING_NAME" &>/dev/null; then
     ok "Network mapping $NET_MAPPING_NAME already exists"
 else
-    az site-recovery network mapping create \
+    az_sr network mapping create \
         -g "$TARGET_RG" --vault-name "$VAULT_NAME" \
         --fabric-name "$SRC_FABRIC" \
         --network-name "$SOURCE_VNET_NAME" \
@@ -257,16 +367,27 @@ else
 fi
 
 # ──────────── 7. Enable replication per VM ────────────────────
+# NOTE: The az site-recovery CLI extension does NOT support the Trusted Launch
+# security profile fields (recoveryVirtualMachineSecurityType, etc.) in its
+# --provider-details schema.  The Portal works because it calls the REST API
+# directly.  We do the same here — use `az rest` with the full JSON payload
+# so Trusted Launch VMs replicate correctly.
+# ──────────────────────────────────────────────────────────────
+
 info "Enabling replication for ${#VM_NAMES[@]} VM(s)..."
 
 TARGET_RG_ID=$(az group show -n "$TARGET_RG" --query "id" -o tsv)
+
+# Build the base resource URI for protected-item operations
+ASR_BASE_URI="/subscriptions/${SUB_ID}/resourceGroups/${TARGET_RG}/providers/Microsoft.RecoveryServices/vaults/${VAULT_NAME}"
+ASR_API_VERSION="2024-10-01"
 
 for vm_name in "${VM_NAMES[@]}"; do
     vm_name="$(echo "$vm_name" | xargs)"  # trim whitespace
     ITEM_NAME="asr-${vm_name}"
 
     # Check if already protected
-    if az site-recovery protected-item show \
+    if az_sr protected-item show \
         -g "$TARGET_RG" --vault-name "$VAULT_NAME" \
         --fabric-name "$SRC_FABRIC" --protection-container "$SRC_CONTAINER" \
         -n "$ITEM_NAME" &>/dev/null; then
@@ -278,30 +399,92 @@ for vm_name in "${VM_NAMES[@]}"; do
 
     vm_json=$(az vm show -g "$SOURCE_RG" -n "$vm_name" -o json)
     vm_id=$(echo "$vm_json" | jq -r '.id')
+    security_type=$(echo "$vm_json" | jq -r '.securityProfile.securityType // "Standard"')
 
-    # Build managed disk list (OS + data disks)
+    # Build managed disk list (OS + data disks) as JSON array
     os_disk_id=$(echo "$vm_json" | jq -r '.storageProfile.osDisk.managedDisk.id')
     os_disk_sku=$(echo "$vm_json" | jq -r '.storageProfile.osDisk.managedDisk.storageAccountType')
 
-    disk_entries="{disk-id:${os_disk_id},primary-staging-azure-storage-account-id:${CACHE_STORAGE_ID},recovery-resource-group-id:${TARGET_RG_ID},recovery-replica-disk-account-type:${os_disk_sku},recovery-target-disk-account-type:${os_disk_sku}}"
+    disk_array=$(jq -n \
+        --arg diskId "$os_disk_id" \
+        --arg cacheId "$CACHE_STORAGE_ID" \
+        --arg recRg "$TARGET_RG_ID" \
+        --arg sku "$os_disk_sku" \
+        '[{
+            diskId: $diskId,
+            primaryStagingAzureStorageAccountId: $cacheId,
+            recoveryResourceGroupId: $recRg,
+            recoveryReplicaDiskAccountType: $sku,
+            recoveryTargetDiskAccountType: $sku
+        }]')
 
     data_disk_count=$(echo "$vm_json" | jq '.storageProfile.dataDisks | length')
     for i in $(seq 0 $((data_disk_count - 1))); do
         dd_id=$(echo "$vm_json" | jq -r ".storageProfile.dataDisks[$i].managedDisk.id")
         dd_sku=$(echo "$vm_json" | jq -r ".storageProfile.dataDisks[$i].managedDisk.storageAccountType")
-        disk_entries="${disk_entries},{disk-id:${dd_id},primary-staging-azure-storage-account-id:${CACHE_STORAGE_ID},recovery-resource-group-id:${TARGET_RG_ID},recovery-replica-disk-account-type:${dd_sku},recovery-target-disk-account-type:${dd_sku}}"
+        disk_array=$(echo "$disk_array" | jq \
+            --arg diskId "$dd_id" \
+            --arg cacheId "$CACHE_STORAGE_ID" \
+            --arg recRg "$TARGET_RG_ID" \
+            --arg sku "$dd_sku" \
+            '. + [{
+                diskId: $diskId,
+                primaryStagingAzureStorageAccountId: $cacheId,
+                recoveryResourceGroupId: $recRg,
+                recoveryReplicaDiskAccountType: $sku,
+                recoveryTargetDiskAccountType: $sku
+            }]')
     done
 
-    provider_details="{a2a:{fabric-object-id:${vm_id},vm-managed-disks:[${disk_entries}],recovery-azure-network-id:${TARGET_VNET_ID},recovery-container-id:${TGT_CONTAINER_ID},recovery-resource-group-id:${TARGET_RG_ID},recovery-subnet-name:${TARGET_SUBNET}}}"
+    # Build providerSpecificDetails — include Trusted Launch fields when needed
+    provider_specific=$(jq -n \
+        --arg instanceType "A2A" \
+        --arg fabricObjId "$vm_id" \
+        --argjson disks "$disk_array" \
+        --arg recNetwork "$TARGET_VNET_ID" \
+        --arg recContainer "$TGT_CONTAINER_ID" \
+        --arg recRg "$TARGET_RG_ID" \
+        --arg recSubnet "$TARGET_SUBNET" \
+        '{
+            instanceType: $instanceType,
+            fabricObjectId: $fabricObjId,
+            vmManagedDisks: $disks,
+            recoveryAzureNetworkId: $recNetwork,
+            recoveryContainerId: $recContainer,
+            recoveryResourceGroupId: $recRg,
+            recoverySubnetName: $recSubnet
+        }')
 
-    az site-recovery protected-item create \
-        -g "$TARGET_RG" --vault-name "$VAULT_NAME" \
-        --fabric-name "$SRC_FABRIC" \
-        --protection-container "$SRC_CONTAINER" \
-        -n "$ITEM_NAME" \
-        --policy-id "$POLICY_ID" \
-        --provider-details "$provider_details" \
-        --no-wait false
+    # Add Trusted Launch security profile for TrustedLaunch VMs
+    if [[ "$security_type" == "TrustedLaunch" ]]; then
+        detail "    Detected Trusted Launch VM — adding security profile to replication request"
+        provider_specific=$(echo "$provider_specific" | jq '. + {recoveryVirtualMachineSecurityType: "TrustedLaunch"}')
+    fi
+
+    # Build full request body
+    request_body=$(jq -n \
+        --arg policyId "$POLICY_ID" \
+        --argjson providerDetails "$provider_specific" \
+        '{
+            properties: {
+                policyId: $policyId,
+                providerSpecificDetails: $providerDetails
+            }
+        }')
+
+    # Use az rest to call the ASR REST API directly (bypasses CLI schema limitation)
+    item_uri="${ASR_BASE_URI}/replicationFabrics/${SRC_FABRIC}/replicationProtectionContainers/${SRC_CONTAINER}/replicationProtectedItems/${ITEM_NAME}?api-version=${ASR_API_VERSION}"
+
+    az rest --method put \
+        --uri "$item_uri" \
+        --body "$request_body" \
+        --output none 2>&1 || {
+        err "  Failed to enable replication for $vm_name. Check vault, fabric, and VM configuration."
+    }
+
+    wait_for_asr_resource "$ASR_REPL_TIMEOUT" "replication item $ITEM_NAME" \
+        az_sr protected-item show -g "$TARGET_RG" --vault-name "$VAULT_NAME" \
+        --fabric-name "$SRC_FABRIC" --protection-container "$SRC_CONTAINER" -n "$ITEM_NAME"
 
     ok "  $vm_name: replication enabled (item: $ITEM_NAME)"
 done
@@ -319,7 +502,7 @@ if [[ "$NO_WAIT" == false ]]; then
             vm_name="$(echo "$vm_name" | xargs)"
             ITEM_NAME="asr-${vm_name}"
 
-            item_json=$(az site-recovery protected-item show \
+            item_json=$(az_sr protected-item show \
                 -g "$TARGET_RG" --vault-name "$VAULT_NAME" \
                 --fabric-name "$SRC_FABRIC" --protection-container "$SRC_CONTAINER" \
                 -n "$ITEM_NAME" -o json 2>/dev/null || echo "{}")
