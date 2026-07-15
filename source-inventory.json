@@ -1,0 +1,107 @@
+[
+  {
+    "vm": "vm-test-01",
+    "size": "Standard_D16ds_v6",
+    "hyperVGen": "server",
+    "securityType": "TrustedLaunch",
+    "secureBoot": true,
+    "vTPM": true,
+    "diskController": "NVMe",
+    "osDiskSku": "Premium_LRS",
+    "dataDisks": [
+      {
+        "name": "disk-data-vm-test-01",
+        "lun": 0,
+        "sizeGB": null,
+        "sku": "Premium_LRS"
+      }
+    ],
+    "nics": [
+      {
+        "nic": "nic-vm-test-01",
+        "nsgOnNic": "nsg-workload",
+        "ipConfigurations": [
+          {
+            "privateIp": null,
+            "allocation": null,
+            "hasPublicIp": false,
+            "subnet": "snet-workload",
+            "lbBackends": [
+              "/subscriptions/c64fd005-b880-4802-9aa8-2dcc75068a20/resourceGroups/rg-migration-test-eastus/providers/Microsoft.Network/loadBalancers/lb-source/backendAddressPools/bepool"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "vm": "vm-test-02",
+    "size": "Standard_D8ds_v6",
+    "hyperVGen": "server",
+    "securityType": "TrustedLaunch",
+    "secureBoot": true,
+    "vTPM": true,
+    "diskController": "NVMe",
+    "osDiskSku": "Premium_LRS",
+    "dataDisks": [
+      {
+        "name": "disk-data-vm-test-02",
+        "lun": 0,
+        "sizeGB": null,
+        "sku": "PremiumV2_LRS"
+      }
+    ],
+    "nics": [
+      {
+        "nic": "nic-vm-test-02",
+        "nsgOnNic": "nsg-workload",
+        "ipConfigurations": [
+          {
+            "privateIp": null,
+            "allocation": null,
+            "hasPublicIp": false,
+            "subnet": "snet-workload",
+            "lbBackends": [
+              "/subscriptions/c64fd005-b880-4802-9aa8-2dcc75068a20/resourceGroups/rg-migration-test-eastus/providers/Microsoft.Network/loadBalancers/lb-source/backendAddressPools/bepool"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "vm": "vm-test-03",
+    "size": "Standard_D2ds_v6",
+    "hyperVGen": "server",
+    "securityType": "TrustedLaunch",
+    "secureBoot": true,
+    "vTPM": true,
+    "diskController": "NVMe",
+    "osDiskSku": "Premium_LRS",
+    "dataDisks": [
+      {
+        "name": "disk-data-vm-test-03",
+        "lun": 0,
+        "sizeGB": null,
+        "sku": "Premium_LRS"
+      }
+    ],
+    "nics": [
+      {
+        "nic": "nic-vm-test-03",
+        "nsgOnNic": "nsg-workload",
+        "ipConfigurations": [
+          {
+            "privateIp": null,
+            "allocation": null,
+            "hasPublicIp": false,
+            "subnet": "snet-workload",
+            "lbBackends": [
+              "/subscriptions/c64fd005-b880-4802-9aa8-2dcc75068a20/resourceGroups/rg-migration-test-eastus/providers/Microsoft.Network/loadBalancers/lb-source/backendAddressPools/bepool"
+            ]
+          }
+        ]
+      }
+    ]
+  }
+]

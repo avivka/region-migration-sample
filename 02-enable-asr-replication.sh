@@ -27,6 +27,7 @@ err()     { echo -e "${RED}ERROR: $*${NC}" >&2; exit 1; }
 _az=$(command -v az)
 AZ_SR_CMD_TIMEOUT=120       # max seconds for any single az_sr call
 ASR_OP_TIMEOUT=300           # 5 min for infra resources (policy, fabric, etc.)
+ASR_MAPPING_TIMEOUT=900      # 15 min for container mappings (slowest infra resource)
 ASR_REPL_TIMEOUT=1800        # 30 min per VM replication enablement
 
 # Wrapper for az_sr that prevents indefinite hangs.
@@ -58,17 +59,25 @@ az_sr() {
 wait_for_asr_resource() {
     local timeout_secs="$1"; shift
     local label="$1"; shift
-    local elapsed=0
+    local start=$SECONDS
+    local next_progress=300
 
     detail "  Waiting for $label to be provisioned (timeout: ${timeout_secs}s)..."
-    while (( elapsed < timeout_secs )); do
+    while (( SECONDS - start < timeout_secs )); do
         if "$@" &>/dev/null; then
             return 0
         fi
         sleep 15
-        elapsed=$((elapsed + 15))
+        local elapsed=$(( SECONDS - start ))
+        if (( elapsed >= next_progress )); then
+            detail "  Still waiting for $label (${elapsed}s / ${timeout_secs}s)..."
+            next_progress=$((next_progress + 300))
+        fi
     done
-    err "Timed out waiting for $label after ${timeout_secs}s"
+    local elapsed=$(( SECONDS - start ))
+    warn "Timed out waiting for $label after ${elapsed}s — fetching last known state:"
+    "$@" 2>&1 || true
+    err "Timed out waiting for $label after ${elapsed}s"
 }
 
 # Wait for an ASR resource to reach a terminal provisioning state (Succeeded).
@@ -176,14 +185,13 @@ info "== Phase 2: Enable ASR Replication =="
 # Using a wrong vault type or vault in wrong region causes hangs and
 # CannotEnableProtection errors.
 info "Validating Recovery Services vault: $VAULT_NAME"
-if ! az resource show --resource-type "Microsoft.RecoveryServices/vaults" \
-        -g "$TARGET_RG" -n "$VAULT_NAME" &>/dev/null 2>&1; then
+if ! az backup vault show -g "$TARGET_RG" -n "$VAULT_NAME" &>/dev/null 2>&1; then
     err "Vault '$VAULT_NAME' not found in resource group '$TARGET_RG'.
   Make sure you ran 01-preflight-and-stage.sh first to create the vault.
-  Do NOT reuse an existing vault created for other purposes (backup, etc.)."
+  Do NOT reuse an existing vault created for other purposes."
 fi
-vault_location=$(az resource show --resource-type "Microsoft.RecoveryServices/vaults" \
-    -g "$TARGET_RG" -n "$VAULT_NAME" --query "location" -o tsv 2>/dev/null \
+vault_location=$(az backup vault show -g "$TARGET_RG" -n "$VAULT_NAME" \
+    --query "location" -o tsv 2>/dev/null \
     | tr '[:upper:]' '[:lower:]' | tr -d ' ')
 expected_location=$(echo "$TARGET_REGION" | tr '[:upper:]' '[:lower:]' | tr -d ' ')
 if [[ "$vault_location" != "$expected_location" ]]; then
@@ -318,16 +326,15 @@ if az_sr protection-container mapping show \
     -n "$MAPPING_NAME" &>/dev/null; then
     ok "Container mapping $MAPPING_NAME already exists"
 else
-    az_sr protection-container mapping create \
+    AZ_SR_CMD_TIMEOUT=900 az_sr protection-container mapping create \
         -g "$TARGET_RG" --vault-name "$VAULT_NAME" \
         --fabric-name "$SRC_FABRIC" \
         --protection-container "$SRC_CONTAINER" \
         -n "$MAPPING_NAME" \
         --policy-id "$POLICY_ID" \
         --target-container "$TGT_CONTAINER_ID" \
-        --provider-input '{a2a:{agent-auto-update-status:Enabled}}' \
-        --no-wait
-    wait_for_asr_resource "$ASR_OP_TIMEOUT" "container mapping $MAPPING_NAME" \
+        --provider-input '{a2a:{}}'
+    wait_for_asr_resource "$ASR_MAPPING_TIMEOUT" "container mapping $MAPPING_NAME" \
         az_sr protection-container mapping show -g "$TARGET_RG" --vault-name "$VAULT_NAME" \
         --fabric-name "$SRC_FABRIC" --protection-container "$SRC_CONTAINER" -n "$MAPPING_NAME"
     ok "Created container mapping: $MAPPING_NAME"
@@ -475,16 +482,24 @@ for vm_name in "${VM_NAMES[@]}"; do
     # Use az rest to call the ASR REST API directly (bypasses CLI schema limitation)
     item_uri="${ASR_BASE_URI}/replicationFabrics/${SRC_FABRIC}/replicationProtectionContainers/${SRC_CONTAINER}/replicationProtectedItems/${ITEM_NAME}?api-version=${ASR_API_VERSION}"
 
-    az rest --method put \
+    rest_output=$(az rest --method put \
         --uri "$item_uri" \
         --body "$request_body" \
-        --output none 2>&1 || {
+        -o json 2>&1) || {
+        echo "$rest_output" >&2
         err "  Failed to enable replication for $vm_name. Check vault, fabric, and VM configuration."
     }
+    # Catch async failures: PUT returns 200/202 (exit 0) but provisioningState may be Failed
+    if echo "$rest_output" | jq -e '.properties.provisioningState == "Failed"' &>/dev/null; then
+        echo "$rest_output" | jq '.properties' >&2
+        err "  Replication enable failed for $vm_name — see error details above."
+    fi
+    detail "    Replication request accepted for $vm_name"
 
+    # Poll using REST API directly — must use the same api-version as the PUT
+    # to avoid the CLI extension's api-version returning a 404 for the new item.
     wait_for_asr_resource "$ASR_REPL_TIMEOUT" "replication item $ITEM_NAME" \
-        az_sr protected-item show -g "$TARGET_RG" --vault-name "$VAULT_NAME" \
-        --fabric-name "$SRC_FABRIC" --protection-container "$SRC_CONTAINER" -n "$ITEM_NAME"
+        az rest --method get --uri "$item_uri" -o none
 
     ok "  $vm_name: replication enabled (item: $ITEM_NAME)"
 done

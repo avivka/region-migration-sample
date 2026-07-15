@@ -274,6 +274,9 @@ for src_nsg_name in $source_nsg_names; do
         r_dst_port=$(echo "$rule" | jq -r '[.destinationPortRange // empty] + (.destinationPortRanges // []) | join(" ")')
         r_desc=$(echo "$rule" | jq -r '.description // empty')
 
+        # Disable globbing so that port/address wildcards ("*") aren't
+        # expanded into filenames by bash.
+        set -f
         cmd=(az network nsg rule create
             -g "$TARGET_RG" --nsg-name "$tgt_nsg_name"
             -n "$r_name" --priority "$r_priority"
@@ -283,6 +286,7 @@ for src_nsg_name in $source_nsg_names; do
             --destination-address-prefixes $r_dst_addr
             --destination-port-ranges $r_dst_port
             -o none)
+        set +f
 
         if [[ -n "$r_desc" ]]; then
             cmd+=(--description "$r_desc")
@@ -350,20 +354,16 @@ fi
 # NOT a Backup vault (Microsoft.DataProtection/BackupVaults).
 # Use a DEDICATED vault — do NOT reuse an existing vault created for other
 # purposes (backup, different region, etc.) as it causes hangs and conflicts.
-if ! az resource show --resource-type "Microsoft.RecoveryServices/vaults" \
-        -g "$TARGET_RG" -n "$VAULT_NAME" &>/dev/null 2>&1; then
+if ! az backup vault show -g "$TARGET_RG" -n "$VAULT_NAME" &>/dev/null 2>&1; then
     info "Creating Recovery Services vault $VAULT_NAME in $TARGET_REGION..."
-    az resource create \
-        --resource-type "Microsoft.RecoveryServices/vaults" \
+    az backup vault create \
         -g "$TARGET_RG" -n "$VAULT_NAME" -l "$TARGET_REGION" \
-        --properties '{}' \
-        --is-full-object false \
         -o none
     ok "Created Recovery Services vault $VAULT_NAME"
 else
     # Verify vault is in the correct region
-    vault_location=$(az resource show --resource-type "Microsoft.RecoveryServices/vaults" \
-        -g "$TARGET_RG" -n "$VAULT_NAME" --query "location" -o tsv 2>/dev/null \
+    vault_location=$(az backup vault show -g "$TARGET_RG" -n "$VAULT_NAME" \
+        --query "location" -o tsv 2>/dev/null \
         | tr '[:upper:]' '[:lower:]' | tr -d ' ')
     expected_location=$(echo "$TARGET_REGION" | tr '[:upper:]' '[:lower:]' | tr -d ' ')
     if [[ "$vault_location" != "$expected_location" ]]; then
