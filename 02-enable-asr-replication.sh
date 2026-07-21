@@ -30,6 +30,15 @@ ASR_OP_TIMEOUT=300           # 5 min for infra resources (policy, fabric, etc.)
 ASR_MAPPING_TIMEOUT=900      # 15 min for container mappings (slowest infra resource)
 ASR_REPL_TIMEOUT=1800        # 30 min per VM replication enablement
 
+# ASR replica disks cannot be Premium SSD v2 or Ultra. If the source disk is
+# one of those, the intermediate replica disk must be Premium SSD v1.
+replica_sku_for() {
+    case "$1" in
+        PremiumV2_LRS|UltraSSD_LRS) echo "Premium_LRS" ;;
+        *) echo "$1" ;;
+    esac
+}
+
 # Wrapper for az_sr that prevents indefinite hangs.
 # Runs the command in background and kills it if it exceeds AZ_SR_CMD_TIMEOUT.
 # Usage: az_sr <subcommand> [args...]   (omit the "site-recovery" prefix)
@@ -212,7 +221,7 @@ if ! az storage account show -g "$SOURCE_RG" -n "$CACHE_STORAGE_ACCT" &>/dev/nul
     info "Creating cache storage account $CACHE_STORAGE_ACCT in $SOURCE_REGION..."
     az storage account create \
         -g "$SOURCE_RG" -n "$CACHE_STORAGE_ACCT" -l "$SOURCE_REGION" \
-        --sku Standard_LRS --kind StorageV2 \
+        --sku Premium_LRS --kind BlockBlobStorage \
         -o none
     ok "Created cache storage account: $CACHE_STORAGE_ACCT"
 else
@@ -411,17 +420,19 @@ for vm_name in "${VM_NAMES[@]}"; do
     # Build managed disk list (OS + data disks) as JSON array
     os_disk_id=$(echo "$vm_json" | jq -r '.storageProfile.osDisk.managedDisk.id')
     os_disk_sku=$(echo "$vm_json" | jq -r '.storageProfile.osDisk.managedDisk.storageAccountType')
+    os_replica_sku=$(replica_sku_for "$os_disk_sku")   
 
     disk_array=$(jq -n \
         --arg diskId "$os_disk_id" \
         --arg cacheId "$CACHE_STORAGE_ID" \
         --arg recRg "$TARGET_RG_ID" \
         --arg sku "$os_disk_sku" \
+        --arg replicaSku "$os_replica_sku" \
         '[{
             diskId: $diskId,
             primaryStagingAzureStorageAccountId: $cacheId,
             recoveryResourceGroupId: $recRg,
-            recoveryReplicaDiskAccountType: $sku,
+            recoveryReplicaDiskAccountType: $replicaSku,
             recoveryTargetDiskAccountType: $sku
         }]')
 
@@ -429,16 +440,18 @@ for vm_name in "${VM_NAMES[@]}"; do
     for i in $(seq 0 $((data_disk_count - 1))); do
         dd_id=$(echo "$vm_json" | jq -r ".storageProfile.dataDisks[$i].managedDisk.id")
         dd_sku=$(echo "$vm_json" | jq -r ".storageProfile.dataDisks[$i].managedDisk.storageAccountType")
+        dd_replica_sku=$(replica_sku_for "$dd_sku")  
         disk_array=$(echo "$disk_array" | jq \
             --arg diskId "$dd_id" \
             --arg cacheId "$CACHE_STORAGE_ID" \
             --arg recRg "$TARGET_RG_ID" \
             --arg sku "$dd_sku" \
+	    --arg replicaSku "$dd_replica_sku" \
             '. + [{
                 diskId: $diskId,
                 primaryStagingAzureStorageAccountId: $cacheId,
                 recoveryResourceGroupId: $recRg,
-                recoveryReplicaDiskAccountType: $sku,
+                recoveryReplicaDiskAccountType: $replicaSku,
                 recoveryTargetDiskAccountType: $sku
             }]')
     done
@@ -466,6 +479,14 @@ for vm_name in "${VM_NAMES[@]}"; do
     if [[ "$security_type" == "TrustedLaunch" ]]; then
         detail "    Detected Trusted Launch VM — adding security profile to replication request"
         provider_specific=$(echo "$provider_specific" | jq '. + {recoveryVirtualMachineSecurityType: "TrustedLaunch"}')
+    fi
+    
+    # Premium SSD v2 / Ultra disks are zonal — a target availability zone is
+    # required in zone-capable regions. Reuse the source VM's zone.
+    vm_zone=$(echo "$vm_json" | jq -r '.zones[0] // empty')
+    if [[ -n "$vm_zone" ]]; then
+        detail "    Setting target availability zone: $vm_zone"
+        provider_specific=$(echo "$provider_specific" | jq --arg z "$vm_zone" '. + {recoveryAvailabilityZone: $z}')
     fi
 
     # Build full request body
