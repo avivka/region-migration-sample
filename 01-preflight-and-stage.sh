@@ -202,6 +202,20 @@ done
 echo "$inventory_json" | jq '.' > "$INVENTORY_OUT"
 ok "Inventory written to $INVENTORY_OUT"
 
+# Derive LB/PIP names from source inventory
+SOURCE_LB_ID=$(echo "$inventory_json" | jq -r '.[0].nics[0].ipConfigurations[0].lbBackends[0] // empty')
+if [[ -n "$SOURCE_LB_ID" ]]; then
+    SOURCE_LB=$(echo "$SOURCE_LB_ID" | awk -F'/loadBalancers/' '{print $2}' | awk -F'/' '{print $1}')
+    SOURCE_BEPOOL=$(echo "$SOURCE_LB_ID" | awk -F'/backendAddressPools/' '{print $2}')
+    LB_NAME="${SOURCE_LB}-target"
+    PIP_NAME="pip-${SOURCE_LB}-target"
+    detail "Derived from source inventory: LB=$LB_NAME PIP=$PIP_NAME POOL=$SOURCE_BEPOOL"
+else
+    LB_NAME="lb-target"
+    PIP_NAME="pip-target-lb"
+    detail "No source LB found in inventory — using defaults: LB=$LB_NAME PIP=$PIP_NAME"
+fi
+
 # ──────────── 2. Target region capacity check ───────────────────
 info "Checking target region SKU availability..."
 needed_sizes=$(echo "$inventory_json" | jq -r '.[].size' | sort -u)
@@ -308,7 +322,6 @@ if [[ -n "$first_tgt_nsg" ]] && [[ "$first_tgt_nsg" != "-target" ]]; then
 fi
 
 # ──────────── 6. Target public IP (new address) ─────────────────
-PIP_NAME="pip-target-lb"
 if ! az network public-ip show -g "$TARGET_RG" -n "$PIP_NAME" &>/dev/null; then
     az network public-ip create \
         -g "$TARGET_RG" -n "$PIP_NAME" -l "$TARGET_REGION" \
@@ -320,7 +333,6 @@ else
 fi
 
 # ──────────── 7. Target Load Balancer ───────────────────────────
-LB_NAME="lb-target"
 if ! az network lb show -g "$TARGET_RG" -n "$LB_NAME" &>/dev/null; then
     az network lb create \
         -g "$TARGET_RG" -n "$LB_NAME" -l "$TARGET_REGION" \
@@ -376,6 +388,10 @@ fi
 # ──────────── Done ──────────────────────────────────────────────
 echo ""
 info "== Pre-flight + staging complete. Review $INVENTORY_OUT, then enable replication. =="
+info ""
+info "Target resource names (pass to 04-planned-failover.sh if not using defaults):"
+echo "  LB:  $LB_NAME"
+echo "  PIP: $PIP_NAME"
 info ""
 info "Next step:"
 info "  Run 02-enable-asr-replication.sh to create the replication policy,"
