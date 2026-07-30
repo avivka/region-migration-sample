@@ -132,6 +132,7 @@ Optional:
   --policy-name NAME            Replication policy name       (default: policy-a2a-24h)
   --cache-storage-acct NAME     Cache storage account name    (default: auto-created)
   --no-wait                     Don't poll for initial sync completion
+  --fix-kernel                  Downgrade VM kernels to ASR-supported version if needed
   -h, --help                    Show this help
 
 Example:
@@ -157,6 +158,7 @@ TARGET_SUBNET="snet-workload"
 POLICY_NAME="policy-a2a-24h"
 CACHE_STORAGE_ACCT=""
 NO_WAIT=false
+FIX_KERNEL=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -171,6 +173,7 @@ while [[ $# -gt 0 ]]; do
         --policy-name)        POLICY_NAME="$2";         shift 2;;
         --cache-storage-acct) CACHE_STORAGE_ACCT="$2";  shift 2;;
         --no-wait)            NO_WAIT=true;             shift;;
+        --fix-kernel)         FIX_KERNEL=true;           shift;;
         -h|--help)            usage;;
         *) err "Unknown argument: $1";;
     esac
@@ -222,13 +225,30 @@ if ! az storage account show -g "$SOURCE_RG" -n "$CACHE_STORAGE_ACCT" &>/dev/nul
     az storage account create \
         -g "$SOURCE_RG" -n "$CACHE_STORAGE_ACCT" -l "$SOURCE_REGION" \
         --sku Premium_LRS --kind BlockBlobStorage \
+        --allow-shared-key-access true \
         -o none
     ok "Created cache storage account: $CACHE_STORAGE_ACCT"
 else
     ok "Cache storage account $CACHE_STORAGE_ACCT already exists"
 fi
 
+# Ensure shared-key access is enabled (required by ASR)
+az storage account update -g "$SOURCE_RG" -n "$CACHE_STORAGE_ACCT" \
+    --allow-shared-key-access true -o none 2>/dev/null || true
+
 CACHE_STORAGE_ID=$(az storage account show -g "$SOURCE_RG" -n "$CACHE_STORAGE_ACCT" --query "id" -o tsv)
+
+# Ensure vault MSI has access to cache storage (required when key-based auth is restricted)
+VAULT_MSI=$(az rest --method get \
+    --url "https://management.azure.com/subscriptions/${SUB_ID}/resourceGroups/${TARGET_RG}/providers/Microsoft.RecoveryServices/vaults/${VAULT_NAME}?api-version=2024-04-01" \
+    --query "identity.principalId" -o tsv 2>/dev/null || echo "")
+if [[ -n "$VAULT_MSI" ]]; then
+    detail "  Granting vault MSI access to cache storage..."
+    az role assignment create --assignee-object-id "$VAULT_MSI" --assignee-principal-type ServicePrincipal \
+        --role "Storage Blob Data Contributor" --scope "$CACHE_STORAGE_ID" -o none 2>/dev/null || true
+    az role assignment create --assignee-object-id "$VAULT_MSI" --assignee-principal-type ServicePrincipal \
+        --role "Contributor" --scope "$CACHE_STORAGE_ID" -o none 2>/dev/null || true
+fi
 
 # ──────────── 2. Replication policy ───────────────────────────
 info "Creating replication policy: $POLICY_NAME"
@@ -335,14 +355,27 @@ if az_sr protection-container mapping show \
     -n "$MAPPING_NAME" &>/dev/null; then
     ok "Container mapping $MAPPING_NAME already exists"
 else
-    AZ_SR_CMD_TIMEOUT=900 az_sr protection-container mapping create \
-        -g "$TARGET_RG" --vault-name "$VAULT_NAME" \
-        --fabric-name "$SRC_FABRIC" \
-        --protection-container "$SRC_CONTAINER" \
-        -n "$MAPPING_NAME" \
-        --policy-id "$POLICY_ID" \
-        --target-container "$TGT_CONTAINER_ID" \
-        --provider-input '{a2a:{}}'
+    # Retry with backoff — vault may report "invalid state" immediately after
+    # container creation (transient ASR timing issue).
+    mapping_created=false
+    for attempt in 1 2 3 4 5; do
+        if AZ_SR_CMD_TIMEOUT=900 az_sr protection-container mapping create \
+            -g "$TARGET_RG" --vault-name "$VAULT_NAME" \
+            --fabric-name "$SRC_FABRIC" \
+            --protection-container "$SRC_CONTAINER" \
+            -n "$MAPPING_NAME" \
+            --policy-id "$POLICY_ID" \
+            --target-container "$TGT_CONTAINER_ID" \
+            --provider-input '{a2a:{}}' 2>/dev/null; then
+            mapping_created=true
+            break
+        fi
+        detail "  Container mapping attempt $attempt failed — vault may still be stabilizing. Waiting 60s..."
+        sleep 60
+    done
+    if [[ "$mapping_created" == false ]]; then
+        err "Failed to create container mapping after 5 attempts. Vault may need more time to stabilize — try re-running the script."
+    fi
     wait_for_asr_resource "$ASR_MAPPING_TIMEOUT" "container mapping $MAPPING_NAME" \
         az_sr protection-container mapping show -g "$TARGET_RG" --vault-name "$VAULT_NAME" \
         --fabric-name "$SRC_FABRIC" --protection-container "$SRC_CONTAINER" -n "$MAPPING_NAME"
@@ -380,6 +413,83 @@ else
         --recovery-fabric-name "$TGT_FABRIC" \
         --fabric-details "{azure-to-azure:{primary-network-id:${SOURCE_VNET_ID}}}"
     ok "Created network mapping: $SOURCE_VNET_NAME -> $TARGET_VNET"
+fi
+
+# ──────────── 6b. (Optional) Check/fix VM kernel for ASR compatibility ──
+# ASR mobility service supports specific kernel versions. If the running kernel
+# is unsupported, replication will fail with error 151141. The --fix-kernel flag
+# installs a supported kernel and reboots the VMs.
+#
+# Supported Ubuntu 24.04 Azure kernel series (as of mobility service 9.66):
+#   6.8.0-*-azure, 6.11.0-*-azure, 6.14.0-*-azure
+# See: https://learn.microsoft.com/en-us/azure/site-recovery/azure-to-azure-support-matrix
+
+# Max supported Azure kernel major.minor for Ubuntu 24.04
+ASR_MAX_KERNEL_MAJOR=6
+ASR_MAX_KERNEL_MINOR=14
+
+check_kernel_supported() {
+    local kernel_ver="$1"
+    # Extract major.minor from kernel (e.g. 6.11.0-1018-azure → 6.11)
+    local k_major k_minor
+    k_major=$(echo "$kernel_ver" | cut -d. -f1)
+    k_minor=$(echo "$kernel_ver" | cut -d. -f2)
+
+    if (( k_major > ASR_MAX_KERNEL_MAJOR )) || \
+       { (( k_major == ASR_MAX_KERNEL_MAJOR )) && (( k_minor > ASR_MAX_KERNEL_MINOR )); }; then
+        return 1  # unsupported
+    fi
+    return 0  # supported
+}
+
+if [[ "$FIX_KERNEL" == true ]]; then
+    info "Checking VM kernel versions for ASR compatibility..."
+    for vm_name in "${VM_NAMES[@]}"; do
+        vm_name="$(echo "$vm_name" | xargs)"
+
+        # Get running kernel via run-command
+        kernel_ver=$(az vm run-command invoke -g "$SOURCE_RG" -n "$vm_name" \
+            --command-id RunShellScript --scripts 'uname -r' \
+            --query "value[0].message" -o tsv 2>/dev/null \
+            | grep -oE '[0-9]+\.[0-9]+\.[0-9]+-[0-9]+-azure' | head -1)
+
+        if [[ -z "$kernel_ver" ]]; then
+            detail "  $vm_name: could not detect kernel — skipping check"
+            continue
+        fi
+
+        if check_kernel_supported "$kernel_ver"; then
+            ok "  $vm_name: kernel $kernel_ver is supported by ASR"
+        else
+            warn "$vm_name: kernel $kernel_ver is NOT supported by ASR (max supported: ${ASR_MAX_KERNEL_MAJOR}.${ASR_MAX_KERNEL_MINOR}.x)"
+            info "  Installing supported kernel on $vm_name..."
+
+            install_result=$(az vm run-command invoke -g "$SOURCE_RG" -n "$vm_name" \
+                --command-id RunShellScript \
+                --scripts 'export DEBIAN_FRONTEND=noninteractive; TARGET_KERNEL=$(apt-cache search "linux-image-6\.11\.0-.*-azure$" 2>/dev/null | grep -v fde | sort -V | tail -1 | awk "{print \$1}"); if [ -z "$TARGET_KERNEL" ]; then TARGET_KERNEL=$(apt-cache search "linux-image-6\.8\.0-.*-azure$" 2>/dev/null | grep -v fde | sort -V | tail -1 | awk "{print \$1}"); fi; if [ -z "$TARGET_KERNEL" ]; then echo "NO_KERNEL_FOUND"; exit 1; fi; MODULES_PKG=$(echo "$TARGET_KERNEL" | sed "s/linux-image-/linux-modules-/"); MODULES_EXTRA_PKG=$(echo "$TARGET_KERNEL" | sed "s/linux-image-/linux-modules-extra-/"); echo "Installing $TARGET_KERNEL..."; apt-get update -qq && apt-get install -y -qq "$TARGET_KERNEL" "$MODULES_PKG" "$MODULES_EXTRA_PKG" 2>&1 | tail -3 && echo "KERNEL_INSTALL_OK" || echo "KERNEL_INSTALL_FAILED"' \
+                --query "value[0].message" -o tsv 2>/dev/null)
+
+            if echo "$install_result" | grep -q "KERNEL_INSTALL_OK"; then
+                ok "  $vm_name: supported kernel installed, rebooting..."
+                az vm restart -g "$SOURCE_RG" -n "$vm_name" --no-wait -o none
+            else
+                err "  $vm_name: failed to install supported kernel. Check VM manually."
+            fi
+        fi
+    done
+
+    # Wait for any rebooting VMs to come back
+    info "Waiting for VMs to come back online after kernel change..."
+    sleep 60
+    for vm_name in "${VM_NAMES[@]}"; do
+        vm_name="$(echo "$vm_name" | xargs)"
+        power=$(az vm show -g "$SOURCE_RG" -n "$vm_name" -d --query "powerState" -o tsv 2>/dev/null || echo "Unknown")
+        while [[ "$power" != "VM running" ]]; do
+            sleep 10
+            power=$(az vm show -g "$SOURCE_RG" -n "$vm_name" -d --query "powerState" -o tsv 2>/dev/null || echo "Unknown")
+        done
+        ok "  $vm_name: running"
+    done
 fi
 
 # ──────────── 7. Enable replication per VM ────────────────────

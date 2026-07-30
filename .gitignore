@@ -45,3 +45,6 @@ terraform.rc
 
 # IDE Related
 .DS_Store
+
+# Migration inventory (contains subscription/resource IDs)
+source-inventory.json
