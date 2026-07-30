@@ -46,6 +46,7 @@ Optional:
   --public-ip-name NAME         Target public IP name       (default: pip-target-lb)
   --lb-name NAME                Target Load Balancer name   (default: lb-target)
   --lb-backend-pool NAME        LB backend pool name        (default: bepool)
+  --source-inventory PATH       Source inventory JSON        (default: ./source-inventory.json)
   --recovery-plan-name NAME     Recovery plan name          (default: plan-region-migration)
   --skip-wiring                 Skip post-failover network wiring
   --skip-commit                 Skip failover commit (do it manually later)
@@ -72,9 +73,12 @@ NSG_NAME=""
 PIP_NAME="pip-target-lb"
 LB_NAME="lb-target"
 LB_BACKEND_POOL="bepool"
+INVENTORY_FILE="./source-inventory.json"
 RECOVERY_PLAN_NAME="plan-region-migration"
 SKIP_WIRING=false
 SKIP_COMMIT=false
+PIP_NAME_SET=false
+LB_NAME_SET=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -85,9 +89,10 @@ while [[ $# -gt 0 ]]; do
         --vault-name)          VAULT_NAME="$2";           shift 2;;
         --vm-names)            VM_NAMES_CSV="$2";         shift 2;;
         --nsg-name)            NSG_NAME="$2";             shift 2;;
-        --public-ip-name)      PIP_NAME="$2";             shift 2;;
-        --lb-name)             LB_NAME="$2";              shift 2;;
+        --public-ip-name)      PIP_NAME="$2"; PIP_NAME_SET=true; shift 2;;
+        --lb-name)             LB_NAME="$2"; LB_NAME_SET=true; shift 2;;
         --lb-backend-pool)     LB_BACKEND_POOL="$2";      shift 2;;
+        --source-inventory)    INVENTORY_FILE="$2";        shift 2;;
         --recovery-plan-name)  RECOVERY_PLAN_NAME="$2";   shift 2;;
         --skip-wiring)         SKIP_WIRING=true;          shift;;
         --skip-commit)         SKIP_COMMIT=true;          shift;;
@@ -104,6 +109,23 @@ done
 [[ -z "$VM_NAMES_CSV" ]]  && err "--vm-names is required"
 
 IFS=',' read -ra VM_NAMES <<< "$VM_NAMES_CSV"
+
+SUB_ID=$(az account show --query "id" -o tsv)
+API_VERSION="2024-10-01"
+
+# Derive LB/PIP names from source inventory if not explicitly set
+if [[ "$LB_NAME_SET" == false ]] && [[ -f "$INVENTORY_FILE" ]]; then
+    src_lb_id=$(jq -r '.[0].nics[0].ipConfigurations[0].lbBackends[0] // empty' "$INVENTORY_FILE")
+    if [[ -n "$src_lb_id" ]]; then
+        SOURCE_LB=$(echo "$src_lb_id" | awk -F'/loadBalancers/' '{print $2}' | awk -F'/' '{print $1}')
+        LB_NAME="${SOURCE_LB}-target"
+        LB_BACKEND_POOL=$(echo "$src_lb_id" | awk -F'/backendAddressPools/' '{print $2}')
+        if [[ "$PIP_NAME_SET" == false ]]; then
+            PIP_NAME="pip-${SOURCE_LB}-target"
+        fi
+        detail "Derived from inventory: LB=$LB_NAME PIP=$PIP_NAME POOL=$LB_BACKEND_POOL"
+    fi
+fi
 
 SRC_FABRIC="fabric-${SOURCE_REGION}"
 TGT_FABRIC="fabric-${TARGET_REGION}"
@@ -190,32 +212,108 @@ for vm_name in "${VM_NAMES[@]}"; do
 
     info "  Failing over $vm_name..."
 
-    az site-recovery protected-item planned-failover \
-        --fabric-name "$SRC_FABRIC" \
-        --protection-container "$SRC_CONTAINER" \
-        -n "$ITEM_NAME" \
-        -g "$TARGET_RG" \
-        --vault-name "$VAULT_NAME" \
-        --failover-direction PrimaryToRecovery \
-        --provider-details '{a2a:{}}' \
-        --no-wait false
+    item_url="https://management.azure.com/subscriptions/${SUB_ID}/resourceGroups/${TARGET_RG}/providers/Microsoft.RecoveryServices/vaults/${VAULT_NAME}/replicationFabrics/${SRC_FABRIC}/replicationProtectionContainers/${SRC_CONTAINER}/replicationProtectedItems/${ITEM_NAME}"
 
-    ok "  $vm_name: planned failover completed"
+    az rest --method post \
+        --url "${item_url}/plannedFailover?api-version=${API_VERSION}" \
+        --body '{"properties":{"failoverDirection":"PrimaryToRecovery","providerSpecificDetails":{"instanceType":"A2A"}}}' \
+        -o none
+
+    ok "  $vm_name: planned failover triggered"
 done
 
+# Poll failover status — WaitingForCompletion and CommitRequired are terminal states
+info "Waiting for failover to complete..."
+fo_start=$SECONDS
+all_done=false
+while [[ "$all_done" == false ]]; do
+    if (( SECONDS - fo_start >= 1800 )); then
+        err "Timed out waiting for failover after 1800s"
+    fi
+    all_done=true
+    for vm_name in "${VM_NAMES[@]}"; do
+        vm_name="$(echo "$vm_name" | xargs)"
+        ITEM_NAME="asr-${vm_name}"
+        item_url="https://management.azure.com/subscriptions/${SUB_ID}/resourceGroups/${TARGET_RG}/providers/Microsoft.RecoveryServices/vaults/${VAULT_NAME}/replicationFabrics/${SRC_FABRIC}/replicationProtectionContainers/${SRC_CONTAINER}/replicationProtectedItems/${ITEM_NAME}"
+
+        fo_state=$(az rest --method get --url "${item_url}?api-version=${API_VERSION}" \
+            -o json 2>/dev/null | jq -r '.properties.failoverState // "Unknown"')
+
+        if [[ "$fo_state" == "WaitingForCompletion" ]] || [[ "$fo_state" == "Succeeded" ]] || [[ "$fo_state" == "CommitRequired" ]]; then
+            ok "  $vm_name: failover done ($fo_state)"
+        elif [[ "$fo_state" == "Failed" ]]; then
+            err "  $vm_name: failover FAILED"
+        else
+            detail "  $vm_name: $fo_state — waiting..."
+            all_done=false
+        fi
+    done
+    if [[ "$all_done" == false ]]; then
+        sleep 30
+    fi
+done
 ok "All VMs failed over to $TARGET_REGION"
 
 # ──────────── 4. Post-failover network wiring ─────────────────
 if [[ "$SKIP_WIRING" == false ]]; then
     info "Running post-failover network wiring..."
 
-    # Load LB and public IP
-    lb_json=$(az network lb show -g "$TARGET_RG" -n "$LB_NAME" -o json)
-    bepool_id=$(echo "$lb_json" | jq -r --arg pool "$LB_BACKEND_POOL" \
-        '.backendAddressPools[] | select(.name == $pool) | .id')
-    [[ -z "$bepool_id" ]] && warn "Backend pool '$LB_BACKEND_POOL' not found in LB '$LB_NAME' — skipping LB wiring"
+    # Wait for VMs to be provisioned in target region
+    info "Waiting for VMs to be provisioned in target region..."
+    for vm_name in "${VM_NAMES[@]}"; do
+        vm_name="$(echo "$vm_name" | xargs)"
+        detail "  Waiting for $vm_name to appear in $TARGET_RG..."
+        start=$SECONDS
+        while (( SECONDS - start < 600 )); do
+            if az vm show -g "$TARGET_RG" -n "$vm_name" --query "id" -o tsv &>/dev/null; then
+                state=$(az vm show -g "$TARGET_RG" -n "$vm_name" --query "provisioningState" -o tsv 2>/dev/null)
+                if [[ "$state" == "Succeeded" ]]; then
+                    ok "  $vm_name: provisioned ($state)"
+                    break
+                fi
+                detail "  $vm_name: exists but provisioningState=$state — waiting..."
+            fi
+            sleep 15
+        done
+        if ! az vm show -g "$TARGET_RG" -n "$vm_name" --query "id" -o tsv &>/dev/null; then
+            warn "$vm_name not found in $TARGET_RG after 600s — skipping wiring"
+        fi
+    done
 
+    # Ensure public IP exists at destination
+    if ! az network public-ip show -g "$TARGET_RG" -n "$PIP_NAME" &>/dev/null; then
+        info "Creating public IP $PIP_NAME in $TARGET_RG..."
+        az network public-ip create \
+            -g "$TARGET_RG" -n "$PIP_NAME" -l "$TARGET_REGION" \
+            --sku Standard --allocation-method Static \
+            -o none
+        ok "Created public IP $PIP_NAME"
+    fi
     pip_address=$(az network public-ip show -g "$TARGET_RG" -n "$PIP_NAME" --query "ipAddress" -o tsv 2>/dev/null || echo "N/A")
+
+    # Verify LB exists and has PIP on frontend
+    bepool_id=""
+    if ! az network lb show -g "$TARGET_RG" -n "$LB_NAME" &>/dev/null; then
+        warn "Load balancer $LB_NAME not found in $TARGET_RG — skipping LB wiring"
+    else
+        lb_json=$(az network lb show -g "$TARGET_RG" -n "$LB_NAME" -o json)
+        bepool_id=$(echo "$lb_json" | jq -r --arg pool "$LB_BACKEND_POOL" \
+            '.backendAddressPools[] | select(.name == $pool) | .id')
+        [[ -z "$bepool_id" ]] && warn "Backend pool '$LB_BACKEND_POOL' not found in LB '$LB_NAME' — skipping LB wiring"
+
+        # Verify PIP is on LB frontend
+        lb_fe_pip=$(echo "$lb_json" | jq -r '.frontendIpConfigurations[0].publicIpAddress.id // empty' | awk -F'/' '{print $NF}')
+        if [[ -z "$lb_fe_pip" ]]; then
+            info "Attaching PIP $PIP_NAME to LB $LB_NAME frontend..."
+            az network lb frontend-ip update \
+                -g "$TARGET_RG" --lb-name "$LB_NAME" -n "fe" \
+                --public-ip-address "$PIP_NAME" \
+                -o none 2>/dev/null || warn "  Could not attach PIP to LB frontend"
+            ok "  PIP $PIP_NAME attached to LB $LB_NAME frontend"
+        else
+            ok "  LB $LB_NAME frontend has PIP: $lb_fe_pip"
+        fi
+    fi
 
     for vm_name in "${VM_NAMES[@]}"; do
         vm_name="$(echo "$vm_name" | xargs)"
@@ -234,45 +332,55 @@ if [[ "$SKIP_WIRING" == false ]]; then
             nic_json=$(az network nic show --ids "$nic_id" -o json)
             nic_name=$(echo "$nic_json" | jq -r '.name')
 
-            # 4a. Associate NSG
+            # 4a. Associate NSG — look up from SOURCE NIC (destination NIC has no NSG after ASR failover)
             if [[ -n "$NSG_NAME" ]]; then
                 target_nsg="$NSG_NAME"
             else
-                source_nsg=$(echo "$nic_json" | jq -r '.networkSecurityGroup.id // empty' | awk -F'/' '{print $NF}')
+                source_nsg=$(az network nic show -g "$SOURCE_RG" -n "$nic_name" \
+                    --query "networkSecurityGroup.id" -o tsv 2>/dev/null | awk -F'/' '{print $NF}')
                 if [[ -n "$source_nsg" ]]; then
                     target_nsg="${source_nsg}"
-                    # If the NSG doesn't already have "-target" suffix, add it
                     if [[ "$target_nsg" != *-target ]]; then
                         target_nsg="${target_nsg}-target"
                     fi
                 else
-                    target_nsg="${nic_name}-target"
+                    warn "  Could not find NSG on source NIC $nic_name in $SOURCE_RG — skipping NSG"
+                    target_nsg=""
                 fi
             fi
 
-            if az network nsg show -g "$TARGET_RG" -n "$target_nsg" &>/dev/null; then
-                az network nic update \
-                    --ids "$nic_id" \
-                    --network-security-group "$target_nsg" \
-                    -o none
-                ok "    NSG $target_nsg associated with NIC $nic_name"
-            else
-                warn "  NSG $target_nsg not found in $TARGET_RG — skipping NSG for $nic_name"
+            if [[ -n "$target_nsg" ]]; then
+                if az network nsg show -g "$TARGET_RG" -n "$target_nsg" &>/dev/null; then
+                    az network nic update \
+                        --ids "$nic_id" \
+                        --network-security-group "$target_nsg" \
+                        -o none
+                    ok "    NSG $target_nsg associated with NIC $nic_name"
+                else
+                    warn "  NSG $target_nsg not found in $TARGET_RG — skipping NSG for $nic_name"
+                fi
             fi
 
-            # 4b. Assign public IP to primary IP config
+            # 4b. Assign public IP to primary IP config (only if source NIC had a direct PIP)
             primary_ipconfig=$(echo "$nic_json" | jq -r '.ipConfigurations[] | select(.primary == true) | .name')
             if [[ -z "$primary_ipconfig" ]]; then
                 primary_ipconfig=$(echo "$nic_json" | jq -r '.ipConfigurations[0].name')
             fi
 
-            az network nic ip-config update \
-                --nic-name "$nic_name" \
-                -g "$TARGET_RG" \
-                --name "$primary_ipconfig" \
-                --public-ip-address "$PIP_NAME" \
-                -o none 2>/dev/null || warn "  Could not assign public IP to $nic_name/$primary_ipconfig"
-            ok "    Public IP $PIP_NAME assigned to $nic_name/$primary_ipconfig"
+            # Check if source NIC had a direct public IP
+            src_nic_pip=$(az network nic show -g "$SOURCE_RG" -n "$nic_name" \
+                --query "ipConfigurations[0].publicIpAddress.id" -o tsv 2>/dev/null || true)
+            if [[ -n "$src_nic_pip" ]] && [[ "$src_nic_pip" != "None" ]]; then
+                az network nic ip-config update \
+                    --nic-name "$nic_name" \
+                    -g "$TARGET_RG" \
+                    --name "$primary_ipconfig" \
+                    --public-ip-address "$PIP_NAME" \
+                    -o none 2>/dev/null || warn "  Could not assign public IP to $nic_name/$primary_ipconfig"
+                ok "    Public IP $PIP_NAME assigned to $nic_name/$primary_ipconfig"
+            else
+                detail "    Source NIC $nic_name had no direct PIP — skipping PIP assignment (PIP is on LB frontend)"
+            fi
 
             # 4c. Add to LB backend pool
             if [[ -n "$bepool_id" ]]; then
@@ -309,13 +417,11 @@ if [[ "$SKIP_COMMIT" == false ]]; then
         vm_name="$(echo "$vm_name" | xargs)"
         ITEM_NAME="asr-${vm_name}"
 
-        az site-recovery protected-item failover-commit \
-            --fabric-name "$SRC_FABRIC" \
-            --protection-container "$SRC_CONTAINER" \
-            -n "$ITEM_NAME" \
-            -g "$TARGET_RG" \
-            --vault-name "$VAULT_NAME" \
-            --no-wait false
+        item_url="https://management.azure.com/subscriptions/${SUB_ID}/resourceGroups/${TARGET_RG}/providers/Microsoft.RecoveryServices/vaults/${VAULT_NAME}/replicationFabrics/${SRC_FABRIC}/replicationProtectionContainers/${SRC_CONTAINER}/replicationProtectedItems/${ITEM_NAME}"
+
+        az rest --method post \
+            --url "${item_url}/commit?api-version=${API_VERSION}" \
+            -o none
 
         ok "  $vm_name: failover committed"
     done
@@ -325,7 +431,8 @@ else
     warn "Skipping failover commit (--skip-commit). Commit manually when ready:"
     for vm_name in "${VM_NAMES[@]}"; do
         vm_name="$(echo "$vm_name" | xargs)"
-        echo "  az site-recovery protected-item failover-commit --fabric-name $SRC_FABRIC --protection-container $SRC_CONTAINER -n asr-${vm_name} -g $TARGET_RG --vault-name $VAULT_NAME"
+        ITEM_NAME="asr-${vm_name}"
+        echo "  az rest --method post --url 'https://management.azure.com/subscriptions/${SUB_ID}/resourceGroups/${TARGET_RG}/providers/Microsoft.RecoveryServices/vaults/${VAULT_NAME}/replicationFabrics/${SRC_FABRIC}/replicationProtectionContainers/${SRC_CONTAINER}/replicationProtectedItems/${ITEM_NAME}/commit?api-version=${API_VERSION}' -o none"
     done
 fi
 

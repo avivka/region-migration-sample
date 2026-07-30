@@ -153,8 +153,8 @@ while [[ "$all_done" == false ]]; do
 
         test_status=$(echo "$item_json" | jq -r '.properties.testFailoverState // "Unknown"')
 
-        if [[ "$test_status" == "TestFailoverCompleted" ]] || [[ "$test_status" == "MarkedForDeletion" ]]; then
-            ok "  $vm_name: test failover complete"
+        if [[ "$test_status" == "TestFailoverCompleted" ]] || [[ "$test_status" == "MarkedForDeletion" ]] || [[ "$test_status" == "WaitingForCompletion" ]]; then
+            ok "  $vm_name: test failover complete ($test_status)"
         elif [[ "$test_status" == "TestFailoverFailed" ]]; then
             err "  $vm_name: test failover FAILED. Check ASR jobs in the portal."
         else
