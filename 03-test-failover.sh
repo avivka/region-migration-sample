@@ -158,6 +158,7 @@ while [[ "$all_done" == false ]]; do
 
         test_status=$(echo "$item_json" | jq -r '.properties.testFailoverState // "Unknown"')
 
+
         # Azure reports TestFailoverCompletionPending when the test VM is up
         # and waiting for user validation + cleanup. This IS the success state.
         if [[ "$test_status" == "TestFailoverCompletionPending" ]] || \

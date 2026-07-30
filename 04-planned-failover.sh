@@ -218,7 +218,6 @@ for vm_name in "${VM_NAMES[@]}"; do
         --url "${item_url}/plannedFailover?api-version=${API_VERSION}" \
         --body '{"properties":{"failoverDirection":"PrimaryToRecovery","providerSpecificDetails":{"instanceType":"A2A"}}}' \
         -o none
-
     ok "  $vm_name: planned failover triggered"
 done
 
@@ -300,6 +299,19 @@ if [[ "$SKIP_WIRING" == false ]]; then
         bepool_id=$(echo "$lb_json" | jq -r --arg pool "$LB_BACKEND_POOL" \
             '.backendAddressPools[] | select(.name == $pool) | .id')
         [[ -z "$bepool_id" ]] && warn "Backend pool '$LB_BACKEND_POOL' not found in LB '$LB_NAME' — skipping LB wiring"
+
+        # Verify PIP is on LB frontend
+        lb_fe_pip=$(echo "$lb_json" | jq -r '.frontendIpConfigurations[0].publicIpAddress.id // empty' | awk -F'/' '{print $NF}')
+        if [[ -z "$lb_fe_pip" ]]; then
+            info "Attaching PIP $PIP_NAME to LB $LB_NAME frontend..."
+            az network lb frontend-ip update \
+                -g "$TARGET_RG" --lb-name "$LB_NAME" -n "fe" \
+                --public-ip-address "$PIP_NAME" \
+                -o none 2>/dev/null || warn "  Could not attach PIP to LB frontend"
+            ok "  PIP $PIP_NAME attached to LB $LB_NAME frontend"
+        else
+            ok "  LB $LB_NAME frontend has PIP: $lb_fe_pip"
+        fi
     fi
 
     for vm_name in "${VM_NAMES[@]}"; do
@@ -348,19 +360,26 @@ if [[ "$SKIP_WIRING" == false ]]; then
                 fi
             fi
 
-            # 4b. Assign public IP to primary IP config
+            # 4b. Assign public IP to primary IP config (only if source NIC had a direct PIP)
             primary_ipconfig=$(echo "$nic_json" | jq -r '.ipConfigurations[] | select(.primary == true) | .name')
             if [[ -z "$primary_ipconfig" ]]; then
                 primary_ipconfig=$(echo "$nic_json" | jq -r '.ipConfigurations[0].name')
             fi
 
-            az network nic ip-config update \
-                --nic-name "$nic_name" \
-                -g "$TARGET_RG" \
-                --name "$primary_ipconfig" \
-                --public-ip-address "$PIP_NAME" \
-                -o none 2>/dev/null || warn "  Could not assign public IP to $nic_name/$primary_ipconfig"
-            ok "    Public IP $PIP_NAME assigned to $nic_name/$primary_ipconfig"
+            # Check if source NIC had a direct public IP
+            src_nic_pip=$(az network nic show -g "$SOURCE_RG" -n "$nic_name" \
+                --query "ipConfigurations[0].publicIpAddress.id" -o tsv 2>/dev/null || true)
+            if [[ -n "$src_nic_pip" ]] && [[ "$src_nic_pip" != "None" ]]; then
+                az network nic ip-config update \
+                    --nic-name "$nic_name" \
+                    -g "$TARGET_RG" \
+                    --name "$primary_ipconfig" \
+                    --public-ip-address "$PIP_NAME" \
+                    -o none 2>/dev/null || warn "  Could not assign public IP to $nic_name/$primary_ipconfig"
+                ok "    Public IP $PIP_NAME assigned to $nic_name/$primary_ipconfig"
+            else
+                detail "    Source NIC $nic_name had no direct PIP — skipping PIP assignment (PIP is on LB frontend)"
+            fi
 
             # 4c. Add to LB backend pool
             if [[ -n "$bepool_id" ]]; then
