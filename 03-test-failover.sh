@@ -139,8 +139,13 @@ info "Waiting for test failover to complete..."
 info "(This may take 10-30 minutes per VM.)"
 echo ""
 
+TFO_TIMEOUT=3600  # 60 min max wait for test failover
+TFO_START=$SECONDS
 all_done=false
 while [[ "$all_done" == false ]]; do
+    if (( SECONDS - TFO_START >= TFO_TIMEOUT )); then
+        err "Timed out waiting for test failover after ${TFO_TIMEOUT}s. Check ASR jobs in the portal."
+    fi
     all_done=true
     for vm_name in "${VM_NAMES[@]}"; do
         vm_name="$(echo "$vm_name" | xargs)"
@@ -153,7 +158,12 @@ while [[ "$all_done" == false ]]; do
 
         test_status=$(echo "$item_json" | jq -r '.properties.testFailoverState // "Unknown"')
 
-        if [[ "$test_status" == "TestFailoverCompleted" ]] || [[ "$test_status" == "MarkedForDeletion" ]] || [[ "$test_status" == "WaitingForCompletion" ]]; then
+
+        # Azure reports TestFailoverCompletionPending when the test VM is up
+        # and waiting for user validation + cleanup. This IS the success state.
+        if [[ "$test_status" == "TestFailoverCompletionPending" ]] || \
+           [[ "$test_status" == "TestFailoverCompleted" ]] || \
+           [[ "$test_status" == "MarkedForDeletion" ]]; then
             ok "  $vm_name: test failover complete ($test_status)"
         elif [[ "$test_status" == "TestFailoverFailed" ]]; then
             err "  $vm_name: test failover FAILED. Check ASR jobs in the portal."
@@ -164,7 +174,8 @@ while [[ "$all_done" == false ]]; do
     done
 
     if [[ "$all_done" == false ]]; then
-        echo "  Waiting 30s before next check..."
+        local_elapsed=$(( SECONDS - TFO_START ))
+        echo "  Waiting 30s before next check... (${local_elapsed}s / ${TFO_TIMEOUT}s)"
         sleep 30
     fi
 done

@@ -218,7 +218,6 @@ for vm_name in "${VM_NAMES[@]}"; do
         --url "${item_url}/plannedFailover?api-version=${API_VERSION}" \
         --body '{"properties":{"failoverDirection":"PrimaryToRecovery","providerSpecificDetails":{"instanceType":"A2A"}}}' \
         -o none
-
     ok "  $vm_name: planned failover triggered"
 done
 
@@ -291,7 +290,7 @@ if [[ "$SKIP_WIRING" == false ]]; then
     fi
     pip_address=$(az network public-ip show -g "$TARGET_RG" -n "$PIP_NAME" --query "ipAddress" -o tsv 2>/dev/null || echo "N/A")
 
-    # Verify LB exists and has PIP on frontend
+    # Verify LB exists
     bepool_id=""
     if ! az network lb show -g "$TARGET_RG" -n "$LB_NAME" &>/dev/null; then
         warn "Load balancer $LB_NAME not found in $TARGET_RG — skipping LB wiring"
