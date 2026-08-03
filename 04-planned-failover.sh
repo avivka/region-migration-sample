@@ -111,7 +111,7 @@ done
 IFS=',' read -ra VM_NAMES <<< "$VM_NAMES_CSV"
 
 SUB_ID=$(az account show --query "id" -o tsv)
-API_VERSION="2024-10-01"
+API_VERSION="2025-08-01"
 
 # Derive LB/PIP names from source inventory if not explicitly set
 if [[ "$LB_NAME_SET" == false ]] && [[ -f "$INVENTORY_FILE" ]]; then
@@ -203,8 +203,13 @@ echo ""
 read -rp "Type 'FAILOVER' to proceed (or Ctrl+C to abort): " confirm
 [[ "$confirm" != "FAILOVER" ]] && err "Aborted — you must type FAILOVER to proceed."
 
-# ──────────── 3. Trigger planned failover per VM ──────────────
-info "Triggering planned failover..."
+# ──────────── 3. Trigger failover per VM ──────────────────────
+# A2A does NOT support "plannedFailover" — use "unplannedFailover" instead.
+# When VMs are Protected and fully synced, unplannedFailover with the latest
+# recovery point produces minimal-to-zero data loss (equivalent to a cutover).
+info "Triggering failover for ${#VM_NAMES[@]} VM(s)..."
+
+rp_url="https://management.azure.com/subscriptions/${SUB_ID}/resourceGroups/${TARGET_RG}/providers/Microsoft.RecoveryServices/vaults/${VAULT_NAME}/replicationRecoveryPlans/${RECOVERY_PLAN_NAME}"
 
 for vm_name in "${VM_NAMES[@]}"; do
     vm_name="$(echo "$vm_name" | xargs)"
@@ -215,13 +220,13 @@ for vm_name in "${VM_NAMES[@]}"; do
     item_url="https://management.azure.com/subscriptions/${SUB_ID}/resourceGroups/${TARGET_RG}/providers/Microsoft.RecoveryServices/vaults/${VAULT_NAME}/replicationFabrics/${SRC_FABRIC}/replicationProtectionContainers/${SRC_CONTAINER}/replicationProtectedItems/${ITEM_NAME}"
 
     az rest --method post \
-        --url "${item_url}/plannedFailover?api-version=${API_VERSION}" \
-        --body '{"properties":{"failoverDirection":"PrimaryToRecovery","providerSpecificDetails":{"instanceType":"A2A"}}}' \
+        --url "${item_url}/unplannedFailover?api-version=${API_VERSION}" \
+        --body '{"properties":{"failoverDirection":"PrimaryToRecovery","sourceSiteOperations":"NotRequired","providerSpecificDetails":{"instanceType":"A2A"}}}' \
         -o none
-    ok "  $vm_name: planned failover triggered"
+    ok "  $vm_name: failover triggered"
 done
 
-# Poll failover status — WaitingForCompletion and CommitRequired are terminal states
+# Poll per-VM failover status
 info "Waiting for failover to complete..."
 fo_start=$SECONDS
 all_done=false
@@ -233,17 +238,21 @@ while [[ "$all_done" == false ]]; do
     for vm_name in "${VM_NAMES[@]}"; do
         vm_name="$(echo "$vm_name" | xargs)"
         ITEM_NAME="asr-${vm_name}"
-        item_url="https://management.azure.com/subscriptions/${SUB_ID}/resourceGroups/${TARGET_RG}/providers/Microsoft.RecoveryServices/vaults/${VAULT_NAME}/replicationFabrics/${SRC_FABRIC}/replicationProtectionContainers/${SRC_CONTAINER}/replicationProtectedItems/${ITEM_NAME}"
 
-        fo_state=$(az rest --method get --url "${item_url}?api-version=${API_VERSION}" \
-            -o json 2>/dev/null | jq -r '.properties.failoverState // "Unknown"')
+        item_json=$(az site-recovery protected-item show \
+            -g "$TARGET_RG" --vault-name "$VAULT_NAME" \
+            --fabric-name "$SRC_FABRIC" --protection-container "$SRC_CONTAINER" \
+            -n "$ITEM_NAME" -o json 2>/dev/null || echo "{}")
 
-        if [[ "$fo_state" == "WaitingForCompletion" ]] || [[ "$fo_state" == "Succeeded" ]] || [[ "$fo_state" == "CommitRequired" ]]; then
-            ok "  $vm_name: failover done ($fo_state)"
-        elif [[ "$fo_state" == "Failed" ]]; then
+        active_loc=$(echo "$item_json" | jq -r '.properties.activeLocation // "Unknown"')
+        prot_state=$(echo "$item_json" | jq -r '.properties.protectionState // "Unknown"')
+
+        if [[ "$active_loc" == "Recovery" ]]; then
+            ok "  $vm_name: failover done (activeLocation=Recovery, protectionState=$prot_state)"
+        elif [[ "$prot_state" == "UnplannedFailoverFailed" ]]; then
             err "  $vm_name: failover FAILED"
         else
-            detail "  $vm_name: $fo_state — waiting..."
+            detail "  $vm_name: activeLocation=$active_loc protectionState=$prot_state — waiting..."
             all_done=false
         fi
     done
@@ -419,7 +428,7 @@ if [[ "$SKIP_COMMIT" == false ]]; then
         item_url="https://management.azure.com/subscriptions/${SUB_ID}/resourceGroups/${TARGET_RG}/providers/Microsoft.RecoveryServices/vaults/${VAULT_NAME}/replicationFabrics/${SRC_FABRIC}/replicationProtectionContainers/${SRC_CONTAINER}/replicationProtectedItems/${ITEM_NAME}"
 
         az rest --method post \
-            --url "${item_url}/commit?api-version=${API_VERSION}" \
+            --url "${item_url}/failoverCommit?api-version=${API_VERSION}" \
             -o none
 
         ok "  $vm_name: failover committed"
@@ -431,7 +440,7 @@ else
     for vm_name in "${VM_NAMES[@]}"; do
         vm_name="$(echo "$vm_name" | xargs)"
         ITEM_NAME="asr-${vm_name}"
-        echo "  az rest --method post --url 'https://management.azure.com/subscriptions/${SUB_ID}/resourceGroups/${TARGET_RG}/providers/Microsoft.RecoveryServices/vaults/${VAULT_NAME}/replicationFabrics/${SRC_FABRIC}/replicationProtectionContainers/${SRC_CONTAINER}/replicationProtectedItems/${ITEM_NAME}/commit?api-version=${API_VERSION}' -o none"
+        echo "  az rest --method post --url 'https://management.azure.com/subscriptions/${SUB_ID}/resourceGroups/${TARGET_RG}/providers/Microsoft.RecoveryServices/vaults/${VAULT_NAME}/replicationFabrics/${SRC_FABRIC}/replicationProtectionContainers/${SRC_CONTAINER}/replicationProtectedItems/${ITEM_NAME}/failoverCommit?api-version=${API_VERSION}' -o none"
     done
 fi
 
