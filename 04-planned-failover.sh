@@ -42,7 +42,9 @@ Required:
   --vm-names VM1,VM2,...        Comma-separated list of VM names
 
 Optional:
-  --nsg-name NAME               Target NSG name (if null, infers "<source-nsg>-target" per NIC)
+  --nsg-name NAME               Target NSG name (default: same name as the source NSG)
+  --nsg-rg NAME                 RG holding the target NSG (default: search TARGET_RG then
+                                RG_CORE_<target-region>; NSG often lives in a shared core RG)
   --public-ip-name NAME         Target public IP name       (default: pip-target-lb)
   --lb-name NAME                Target Load Balancer name   (default: lb-target)
   --lb-backend-pool NAME        LB backend pool name        (default: bepool)
@@ -70,6 +72,7 @@ TARGET_REGION=""
 VAULT_NAME=""
 VM_NAMES_CSV=""
 NSG_NAME=""
+NSG_RG=""
 PIP_NAME="pip-target-lb"
 LB_NAME="lb-target"
 LB_BACKEND_POOL="bepool"
@@ -89,6 +92,7 @@ while [[ $# -gt 0 ]]; do
         --vault-name)          VAULT_NAME="$2";           shift 2;;
         --vm-names)            VM_NAMES_CSV="$2";         shift 2;;
         --nsg-name)            NSG_NAME="$2";             shift 2;;
+        --nsg-rg)              NSG_RG="$2";               shift 2;;
         --public-ip-name)      PIP_NAME="$2"; PIP_NAME_SET=true; shift 2;;
         --lb-name)             LB_NAME="$2"; LB_NAME_SET=true; shift 2;;
         --lb-backend-pool)     LB_BACKEND_POOL="$2";      shift 2;;
@@ -107,6 +111,13 @@ done
 [[ -z "$TARGET_REGION" ]] && err "--target-region is required"
 [[ -z "$VAULT_NAME" ]]    && err "--vault-name is required"
 [[ -z "$VM_NAMES_CSV" ]]  && err "--vm-names is required"
+
+# Catch the common copy-paste trap where a placeholder is passed verbatim.
+for _v in "--source-rg=$SOURCE_RG" "--target-rg=$TARGET_RG" "--nsg-rg=$NSG_RG"; do
+    _flag="${_v%%=*}"; _val="${_v#*=}"
+    [[ "$_val" == *"<"* || "$_val" == *">"* ]] && \
+        err "$_flag looks like a placeholder ('$_val') — pass the real resource group name."
+done
 
 IFS=',' read -ra VM_NAMES <<< "$VM_NAMES_CSV"
 
@@ -340,32 +351,49 @@ if [[ "$SKIP_WIRING" == false ]]; then
             nic_json=$(az network nic show --ids "$nic_id" -o json)
             nic_name=$(echo "$nic_json" | jq -r '.name')
 
-            # 4a. Associate NSG — look up from SOURCE NIC (destination NIC has no NSG after ASR failover)
+            # 4a. Associate NSG. Target NSG keeps the source NSG's name but usually
+            # lives in a shared core RG (RG_CORE_<region>), not the tenant RG.
             if [[ -n "$NSG_NAME" ]]; then
                 target_nsg="$NSG_NAME"
             else
-                source_nsg=$(az network nic show -g "$SOURCE_RG" -n "$nic_name" \
-                    --query "networkSecurityGroup.id" -o tsv 2>/dev/null | awk -F'/' '{print $NF}')
-                if [[ -n "$source_nsg" ]]; then
-                    target_nsg="${source_nsg}"
-                    if [[ "$target_nsg" != *-target ]]; then
-                        target_nsg="${target_nsg}-target"
-                    fi
-                else
-                    warn "  Could not find NSG on source NIC $nic_name in $SOURCE_RG — skipping NSG"
-                    target_nsg=""
+                # NSG name from inventory; guarded live fallback (|| true so a missing
+                # source NIC/NSG can't abort the run under set -euo pipefail).
+                target_nsg=$(jq -r --arg nic "$nic_name" \
+                    '.[].nics[]? | select(.nic == $nic) | .nsgOnNic // empty' \
+                    "$INVENTORY_FILE" 2>/dev/null | head -n1 || true)
+                if [[ -z "$target_nsg" ]]; then
+                    target_nsg=$(az network nic show -g "$SOURCE_RG" -n "$nic_name" \
+                        --query "networkSecurityGroup.id" -o tsv 2>/dev/null \
+                        | awk -F'/' '{print $NF}' || true)
                 fi
+                [[ -z "$target_nsg" ]] && \
+                    warn "  Could not determine source NSG for NIC $nic_name — skipping NSG"
             fi
 
             if [[ -n "$target_nsg" ]]; then
-                if az network nsg show -g "$TARGET_RG" -n "$target_nsg" &>/dev/null; then
+                # explicit --nsg-rg wins; otherwise search tenant RG then core RG.
+                if [[ -n "$NSG_RG" ]]; then
+                    nsg_search_rgs=("$NSG_RG")
+                else
+                    nsg_search_rgs=("$TARGET_RG" "RG_CORE_${TARGET_REGION}")
+                fi
+
+                nsg_id=""; nsg_rg_found=""
+                for cand_rg in "${nsg_search_rgs[@]}"; do
+                    nsg_id=$(az network nsg show -g "$cand_rg" -n "$target_nsg" \
+                        --query "id" -o tsv 2>/dev/null || true)
+                    if [[ -n "$nsg_id" ]]; then nsg_rg_found="$cand_rg"; break; fi
+                done
+
+                if [[ -n "$nsg_id" ]]; then
+                    # Cross-RG association requires the full NSG ID, not a bare name.
                     az network nic update \
                         --ids "$nic_id" \
-                        --network-security-group "$target_nsg" \
+                        --network-security-group "$nsg_id" \
                         -o none
-                    ok "    NSG $target_nsg associated with NIC $nic_name"
+                    ok "    NSG $target_nsg (in $nsg_rg_found) associated with NIC $nic_name"
                 else
-                    warn "  NSG $target_nsg not found in $TARGET_RG — skipping NSG for $nic_name"
+                    warn "  NSG $target_nsg not found in ${nsg_search_rgs[*]} — skipping NSG for $nic_name (pass --nsg-name/--nsg-rg)"
                 fi
             fi
 

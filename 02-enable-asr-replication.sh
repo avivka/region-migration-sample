@@ -226,28 +226,55 @@ if ! az storage account show -g "$SOURCE_RG" -n "$CACHE_STORAGE_ACCT" &>/dev/nul
         -g "$SOURCE_RG" -n "$CACHE_STORAGE_ACCT" -l "$SOURCE_REGION" \
         --sku Premium_LRS --kind BlockBlobStorage \
         --allow-shared-key-access true \
+        --public-network-access Enabled --default-action Deny --bypass AzureServices \
         -o none
     ok "Created cache storage account: $CACHE_STORAGE_ACCT"
 else
     ok "Cache storage account $CACHE_STORAGE_ACCT already exists"
 fi
 
-# Ensure shared-key access is enabled (required by ASR)
+# Lock the cache account down: default-deny firewall, allow only trusted Microsoft
+# services (the vault reaches it that way). Public endpoint stays Enabled-but-denied
+# — fully Disabled would also block the trusted-service path and break ASR. Source
+# VMs reach the cache over a private endpoint (configured below).
 az storage account update -g "$SOURCE_RG" -n "$CACHE_STORAGE_ACCT" \
-    --allow-shared-key-access true -o none 2>/dev/null || true
+    --allow-shared-key-access true \
+    --public-network-access Enabled --default-action Deny --bypass AzureServices \
+    -o none 2>/dev/null || true
 
 CACHE_STORAGE_ID=$(az storage account show -g "$SOURCE_RG" -n "$CACHE_STORAGE_ACCT" --query "id" -o tsv)
 
-# Ensure vault MSI has access to cache storage (required when key-based auth is restricted)
-VAULT_MSI=$(az rest --method get \
-    --url "https://management.azure.com/subscriptions/${SUB_ID}/resourceGroups/${TARGET_RG}/providers/Microsoft.RecoveryServices/vaults/${VAULT_NAME}?api-version=2024-04-01" \
-    --query "identity.principalId" -o tsv 2>/dev/null || echo "")
-if [[ -n "$VAULT_MSI" ]]; then
-    detail "  Granting vault MSI access to cache storage..."
-    az role assignment create --assignee-object-id "$VAULT_MSI" --assignee-principal-type ServicePrincipal \
-        --role "Storage Blob Data Contributor" --scope "$CACHE_STORAGE_ID" -o none 2>/dev/null || true
-    az role assignment create --assignee-object-id "$VAULT_MSI" --assignee-principal-type ServicePrincipal \
-        --role "Contributor" --scope "$CACHE_STORAGE_ID" -o none 2>/dev/null || true
+# Ensure the vault has a system-assigned MSI, then grant it access to the cache
+# storage account. ASR uses the vault MSI to reach the cache; without this,
+# enable-replication fails with error 28143.
+VAULT_URL="https://management.azure.com/subscriptions/${SUB_ID}/resourceGroups/${TARGET_RG}/providers/Microsoft.RecoveryServices/vaults/${VAULT_NAME}?api-version=2024-04-01"
+VAULT_MSI=$(az rest --method get --url "$VAULT_URL" --query "identity.principalId" -o tsv 2>/dev/null || echo "")
+if [[ -z "$VAULT_MSI" || "$VAULT_MSI" == "null" ]]; then
+    detail "  Enabling system-assigned identity on vault $VAULT_NAME..."
+    az rest --method patch --url "$VAULT_URL" \
+        --headers "Content-Type=application/json" \
+        --body '{"identity":{"type":"SystemAssigned"}}' -o none
+    for _ in $(seq 1 12); do
+        VAULT_MSI=$(az rest --method get --url "$VAULT_URL" --query "identity.principalId" -o tsv 2>/dev/null || echo "")
+        [[ -n "$VAULT_MSI" && "$VAULT_MSI" != "null" ]] && break
+        sleep 5
+    done
+fi
+if [[ -n "$VAULT_MSI" && "$VAULT_MSI" != "null" ]]; then
+    detail "  Granting vault MSI ($VAULT_MSI) access to cache storage..."
+    # Cache account is Premium BlockBlob → "Storage Blob Data Owner" (per ASR guidance).
+    for role in "Storage Blob Data Owner" "Contributor"; do
+        az role assignment create --assignee-object-id "$VAULT_MSI" --assignee-principal-type ServicePrincipal \
+            --role "$role" --scope "$CACHE_STORAGE_ID" -o none 2>/dev/null \
+            || detail "    role '$role' already assigned or pending"
+    done
+    # RBAC propagation for a fresh MSI can lag several minutes; wait before ASR
+    # enable relies on it. If enable still fails with 28143, re-run — the item is
+    # now self-healing (purged and retried) once propagation completes.
+    detail "  Waiting 150s for role assignments to propagate..."
+    sleep 150
+else
+    warn "  Could not obtain vault managed identity — ASR enable may fail with error 28143"
 fi
 
 # ──────────── 2. Replication policy ───────────────────────────
@@ -393,8 +420,31 @@ first_nic_json=$(az network nic show --ids "$first_nic_id" -o json)
 source_subnet_id=$(echo "$first_nic_json" | jq -r '.ipConfigurations[0].subnet.id')
 # Extract VNet name from subnet ID: .../virtualNetworks/<vnet>/subnets/<subnet>
 SOURCE_VNET_NAME=$(echo "$source_subnet_id" | awk -F'/virtualNetworks/' '{print $2}' | awk -F'/' '{print $1}')
+SOURCE_SUBNET_NAME=$(echo "$source_subnet_id" | awk -F'/subnets/' '{print $2}')
 SOURCE_VNET_ID=$(az network vnet show -g "$SOURCE_RG" -n "$SOURCE_VNET_NAME" --query "id" -o tsv)
 TARGET_VNET_ID=$(az network vnet show -g "$TARGET_RG" -n "$TARGET_VNET" --query "id" -o tsv)
+
+# ── Private endpoint so source VMs push replication data to the cache account
+#    over private link (the account firewall denies all other public access) ──
+PE_NAME="pe-${CACHE_STORAGE_ACCT}-blob"
+BLOB_DNS_ZONE="privatelink.blob.core.windows.net"
+if ! az network private-endpoint show -g "$SOURCE_RG" -n "$PE_NAME" &>/dev/null; then
+    info "Creating private endpoint $PE_NAME for cache storage in $SOURCE_VNET_NAME/$SOURCE_SUBNET_NAME..."
+    az network private-dns zone create -g "$SOURCE_RG" -n "$BLOB_DNS_ZONE" -o none 2>/dev/null || true
+    az network private-dns link vnet create -g "$SOURCE_RG" --zone-name "$BLOB_DNS_ZONE" \
+        -n "link-${SOURCE_VNET_NAME}" --virtual-network "$SOURCE_VNET_NAME" \
+        --registration-enabled false -o none 2>/dev/null || true
+    az network private-endpoint create -g "$SOURCE_RG" -n "$PE_NAME" \
+        --vnet-name "$SOURCE_VNET_NAME" --subnet "$SOURCE_SUBNET_NAME" \
+        --private-connection-resource-id "$CACHE_STORAGE_ID" --group-id blob \
+        --connection-name "${CACHE_STORAGE_ACCT}-blob-conn" -l "$SOURCE_REGION" -o none
+    az network private-endpoint dns-zone-group create -g "$SOURCE_RG" \
+        --endpoint-name "$PE_NAME" -n zg-blob \
+        --private-dns-zone "$BLOB_DNS_ZONE" --zone-name blob -o none
+    ok "Created private endpoint for cache storage (private data path)"
+else
+    ok "Private endpoint $PE_NAME already exists"
+fi
 
 NET_MAPPING_NAME="netmap-${SOURCE_REGION}-to-${TARGET_REGION}"
 
@@ -512,13 +562,23 @@ for vm_name in "${VM_NAMES[@]}"; do
     vm_name="$(echo "$vm_name" | xargs)"  # trim whitespace
     ITEM_NAME="asr-${vm_name}"
 
-    # Check if already protected
-    if az_sr protected-item show \
-        -g "$TARGET_RG" --vault-name "$VAULT_NAME" \
-        --fabric-name "$SRC_FABRIC" --protection-container "$SRC_CONTAINER" \
-        -n "$ITEM_NAME" &>/dev/null; then
-        ok "  $vm_name: replication already enabled — skipping"
-        continue
+    # Skip if already protected/healthy; purge and re-enable if a prior attempt
+    # left the item in a *Failed* state (otherwise a re-run silently skips it).
+    item_uri_existing="${ASR_BASE_URI}/replicationFabrics/${SRC_FABRIC}/replicationProtectionContainers/${SRC_CONTAINER}/replicationProtectedItems/${ITEM_NAME}?api-version=${ASR_API_VERSION}"
+    existing_state=$(az rest --method get --uri "$item_uri_existing" \
+        --query "properties.protectionState" -o tsv 2>/dev/null || echo "")
+    if [[ -n "$existing_state" ]]; then
+        if [[ "$existing_state" == *Failed* ]]; then
+            warn "  $vm_name: found in $existing_state — purging to re-enable..."
+            az rest --method delete --uri "$item_uri_existing" -o none 2>/dev/null || true
+            for _ in $(seq 1 40); do
+                az rest --method get --uri "$item_uri_existing" -o none 2>/dev/null || break
+                sleep 15
+            done
+        else
+            ok "  $vm_name: replication already enabled ($existing_state) — skipping"
+            continue
+        fi
     fi
 
     info "  Enabling replication for $vm_name..."
@@ -642,6 +702,7 @@ if [[ "$NO_WAIT" == false ]]; then
     echo ""
 
     all_synced=false
+    failed_vms=""
     while [[ "$all_synced" == false ]]; do
         all_synced=true
         for vm_name in "${VM_NAMES[@]}"; do
@@ -656,17 +717,42 @@ if [[ "$NO_WAIT" == false ]]; then
             state=$(echo "$item_json" | jq -r '.properties.protectionState // "Unknown"')
             health=$(echo "$item_json" | jq -r '.properties.replicationHealth // "Unknown"')
 
-            if [[ "$state" == "Protected" ]]; then
-                ok "  $vm_name: Protected (health: $health)"
-            else
-                detail "  $vm_name: $state (health: $health) — syncing..."
-                all_synced=false
-            fi
+            case "$state" in
+                Protected)
+                    ok "  $vm_name: Protected (health: $health)" ;;
+                *Failed*)
+                    # Terminal failure — don't loop forever. Surface the health error.
+                    hint=$(echo "$item_json" | jq -r '[.properties.healthErrors[]? | .errorMessage] | join("; ") // empty')
+                    warn "  $vm_name: $state (health: $health) — enable FAILED: ${hint:-see portal}"
+                    failed_vms="${failed_vms} ${vm_name}"
+                    all_synced=false ;;
+                *)
+                    detail "  $vm_name: $state (health: $health) — syncing..."
+                    all_synced=false ;;
+            esac
         done
+
+        # If every not-yet-Protected VM is in a *Failed* state, stop — no progress possible.
+        if [[ "$all_synced" == false && -n "$failed_vms" ]]; then
+            still_syncing=false
+            for vm_name in "${VM_NAMES[@]}"; do
+                vm_name="$(echo "$vm_name" | xargs)"
+                [[ " $failed_vms " == *" $vm_name "* ]] && continue
+                ITEM_NAME="asr-${vm_name}"
+                st=$(az_sr protected-item show -g "$TARGET_RG" --vault-name "$VAULT_NAME" \
+                    --fabric-name "$SRC_FABRIC" --protection-container "$SRC_CONTAINER" \
+                    -n "$ITEM_NAME" --query "properties.protectionState" -o tsv 2>/dev/null || echo "")
+                [[ "$st" != "Protected" ]] && still_syncing=true
+            done
+            if [[ "$still_syncing" == false ]]; then
+                err "Enable replication failed for:${failed_vms}. Fix the health errors above (e.g. grant the vault MSI access to the cache storage account) and re-run this script."
+            fi
+        fi
 
         if [[ "$all_synced" == false ]]; then
             echo "  Waiting 60s before next check..."
             sleep 60
+            failed_vms=""
         fi
     done
 
