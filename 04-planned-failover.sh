@@ -18,6 +18,17 @@
 
 set -euo pipefail
 
+# ──────────────────────────── Logging ───────────────────────────
+# Timestamped console output, mirrored (color-stripped) to logs/<script>-<run>.log
+LOG_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/logs"
+mkdir -p "$LOG_DIR"
+LOG_FILE="${LOG_DIR}/$(basename "$0" .sh)-$(date +%Y%m%d-%H%M%S).log"
+exec > >(while IFS= read -r line; do
+    ts=$(date '+%Y-%m-%d %H:%M:%S')
+    printf '[%s] %s\n' "$ts" "$line"
+    printf '[%s] %s\n' "$ts" "$(printf '%s' "$line" | sed $'s/\x1b\\[[0-9;]*m//g')" >> "$LOG_FILE"
+done) 2>&1
+
 # ──────────────────────────── Colors ────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; NC='\033[0m'
 info()    { echo -e "${CYAN}$*${NC}"; }
@@ -274,6 +285,7 @@ done
 ok "All VMs failed over to $TARGET_REGION"
 
 # ──────────── 4. Post-failover network wiring ─────────────────
+VM_PIP_SUMMARY=()
 if [[ "$SKIP_WIRING" == false ]]; then
     info "Running post-failover network wiring..."
 
@@ -308,7 +320,25 @@ if [[ "$SKIP_WIRING" == false ]]; then
             -o none
         ok "Created public IP $PIP_NAME"
     fi
+
+    # Copy the source LB frontend PIP DNS label onto the target LB PIP
+    # (casing differs across az CLI versions)
+    if [[ -n "${SOURCE_LB:-}" ]]; then
+        src_lb_pip_id=$(az network lb show -g "$SOURCE_RG" -n "$SOURCE_LB" -o json 2>/dev/null \
+            | jq -r '(((.frontendIPConfigurations // .frontendIpConfigurations // [])[0]
+                | (.publicIPAddress // .publicIpAddress // {}).id) // empty)' || true)
+        src_lb_label=""
+        [[ -n "$src_lb_pip_id" ]] && src_lb_label=$(az network public-ip show --ids "$src_lb_pip_id" \
+            --query "dnsSettings.domainNameLabel" -o tsv 2>/dev/null || true)
+        if [[ -n "$src_lb_label" && "$src_lb_label" != "None" ]]; then
+            az network public-ip update -g "$TARGET_RG" -n "$PIP_NAME" \
+                --dns-name "$src_lb_label" -o none 2>/dev/null \
+                && ok "DNS label '$src_lb_label' set on $PIP_NAME" \
+                || warn "Could not set DNS label '$src_lb_label' on $PIP_NAME"
+        fi
+    fi
     pip_address=$(az network public-ip show -g "$TARGET_RG" -n "$PIP_NAME" --query "ipAddress" -o tsv 2>/dev/null || echo "N/A")
+    pip_fqdn=$(az network public-ip show -g "$TARGET_RG" -n "$PIP_NAME" --query "dnsSettings.fqdn" -o tsv 2>/dev/null || true)
 
     # Verify LB exists
     bepool_id=""
@@ -321,16 +351,32 @@ if [[ "$SKIP_WIRING" == false ]]; then
         [[ -z "$bepool_id" ]] && warn "Backend pool '$LB_BACKEND_POOL' not found in LB '$LB_NAME' — skipping LB wiring"
 
         # Verify PIP is on LB frontend
-        lb_fe_pip=$(echo "$lb_json" | jq -r '.frontendIpConfigurations[0].publicIpAddress.id // empty' | awk -F'/' '{print $NF}')
+        # Property casing differs across az CLI versions (publicIpAddress vs publicIPAddress)
+        lb_fe_pip=$(echo "$lb_json" | jq -r '(((.frontendIPConfigurations // .frontendIpConfigurations // [])[0]
+            | (.publicIPAddress // .publicIpAddress // {}).id) // empty)' | awk -F'/' '{print $NF}')
         if [[ -z "$lb_fe_pip" ]]; then
-            info "Attaching PIP $PIP_NAME to LB $LB_NAME frontend..."
+            lb_fe_name=$(echo "$lb_json" | jq -r \
+                '(.frontendIPConfigurations // .frontendIpConfigurations // [])[0].name // "fe"')
+            info "Attaching PIP $PIP_NAME to LB $LB_NAME frontend $lb_fe_name..."
             az network lb frontend-ip update \
-                -g "$TARGET_RG" --lb-name "$LB_NAME" -n "fe" \
+                -g "$TARGET_RG" --lb-name "$LB_NAME" -n "$lb_fe_name" \
                 --public-ip-address "$PIP_NAME" \
                 -o none 2>/dev/null || warn "  Could not attach PIP to LB frontend"
             ok "  PIP $PIP_NAME attached to LB $LB_NAME frontend"
         else
             ok "  LB $LB_NAME frontend has PIP: $lb_fe_pip"
+        fi
+
+        # Probe parity check — target probes must match the source (e.g. ping_api)
+        if [[ -n "${SOURCE_LB:-}" ]]; then
+            src_probes=$(az network lb show -g "$SOURCE_RG" -n "$SOURCE_LB" -o json 2>/dev/null \
+                | jq -S '[(.probes // [])[] | {name, protocol, port, requestPath}] | sort_by(.name)' || echo '[]')
+            tgt_probes=$(echo "$lb_json" | jq -S '[(.probes // [])[] | {name, protocol, port, requestPath}] | sort_by(.name)')
+            if [[ "$src_probes" != "$tgt_probes" ]]; then
+                warn "Target LB probes differ from source LB — re-run 01-preflight-and-stage.sh to mirror probes/rules"
+            else
+                ok "  LB probes match source"
+            fi
         fi
     fi
 
@@ -378,11 +424,15 @@ if [[ "$SKIP_WIRING" == false ]]; then
                     nsg_search_rgs=("$TARGET_RG" "RG_CORE_${TARGET_REGION}")
                 fi
 
-                nsg_id=""; nsg_rg_found=""
+                # Try the source NSG name first (CX layout: same name in a core RG),
+                # then the "<name>-target" convention used by script 01 staging.
+                nsg_id=""; nsg_rg_found=""; nsg_name_found=""
                 for cand_rg in "${nsg_search_rgs[@]}"; do
-                    nsg_id=$(az network nsg show -g "$cand_rg" -n "$target_nsg" \
-                        --query "id" -o tsv 2>/dev/null || true)
-                    if [[ -n "$nsg_id" ]]; then nsg_rg_found="$cand_rg"; break; fi
+                    for cand_name in "$target_nsg" "${target_nsg}-target"; do
+                        nsg_id=$(az network nsg show -g "$cand_rg" -n "$cand_name" \
+                            --query "id" -o tsv 2>/dev/null || true)
+                        if [[ -n "$nsg_id" ]]; then nsg_rg_found="$cand_rg"; nsg_name_found="$cand_name"; break 2; fi
+                    done
                 done
 
                 if [[ -n "$nsg_id" ]]; then
@@ -391,31 +441,72 @@ if [[ "$SKIP_WIRING" == false ]]; then
                         --ids "$nic_id" \
                         --network-security-group "$nsg_id" \
                         -o none
-                    ok "    NSG $target_nsg (in $nsg_rg_found) associated with NIC $nic_name"
+                    ok "    NSG $nsg_name_found (in $nsg_rg_found) associated with NIC $nic_name"
                 else
                     warn "  NSG $target_nsg not found in ${nsg_search_rgs[*]} — skipping NSG for $nic_name (pass --nsg-name/--nsg-rg)"
                 fi
             fi
 
-            # 4b. Assign public IP to primary IP config (only if source NIC had a direct PIP)
+            # 4b. Per-VM public IP. If the source NIC has a direct PIP, recreate it in the
+            # target (same name/SKU/DNS label) and attach it — the LB frontend PIP cannot
+            # double as a NIC PIP. Inventory first, live lookup as fallback; property
+            # casing differs across az CLI versions.
             primary_ipconfig=$(echo "$nic_json" | jq -r '.ipConfigurations[] | select(.primary == true) | .name')
             if [[ -z "$primary_ipconfig" ]]; then
                 primary_ipconfig=$(echo "$nic_json" | jq -r '.ipConfigurations[0].name')
             fi
 
-            # Check if source NIC had a direct public IP
-            src_nic_pip=$(az network nic show -g "$SOURCE_RG" -n "$nic_name" \
-                --query "ipConfigurations[0].publicIpAddress.id" -o tsv 2>/dev/null || true)
-            if [[ -n "$src_nic_pip" ]] && [[ "$src_nic_pip" != "None" ]]; then
+            src_pip_id=$(jq -r --arg nic "$nic_name" \
+                '[.[].nics[]? | select(.nic == $nic) | .ipConfigurations[].publicIpId // empty] | first // empty' \
+                "$INVENTORY_FILE" 2>/dev/null || true)
+            if [[ -z "$src_pip_id" ]]; then
+                src_pip_id=$(az network nic show -g "$SOURCE_RG" -n "$nic_name" -o json 2>/dev/null \
+                    | jq -r '[.ipConfigurations[] | (.publicIPAddress // .publicIpAddress) | select(. != null) | .id][0] // empty' || true)
+            fi
+
+            if [[ -n "$src_pip_id" ]] && [[ "$src_pip_id" != "None" ]]; then
+                src_pip_json=$(az network public-ip show --ids "$src_pip_id" -o json 2>/dev/null || echo '{}')
+                vm_pip_name=$(echo "$src_pip_json" | jq -r '.name // empty')
+                [[ -z "$vm_pip_name" ]] && vm_pip_name="${vm_name}-pip"
+                vm_pip_sku=$(echo "$src_pip_json" | jq -r '.sku.name // "Standard"')
+                # Basic PIPs can no longer be created — upgrade to Standard
+                [[ "$vm_pip_sku" == "Basic" ]] && vm_pip_sku="Standard"
+                vm_dns_label=$(echo "$src_pip_json" | jq -r '.dnsSettings.domainNameLabel // empty')
+
+                if ! az network public-ip show -g "$TARGET_RG" -n "$vm_pip_name" &>/dev/null; then
+                    info "    Creating per-VM public IP $vm_pip_name..."
+                    pip_args=(-g "$TARGET_RG" -n "$vm_pip_name" -l "$TARGET_REGION"
+                              --sku "$vm_pip_sku" --allocation-method Static)
+                    [[ -n "$vm_dns_label" ]] && pip_args+=(--dns-name "$vm_dns_label")
+                    if ! az network public-ip create "${pip_args[@]}" -o none 2>/dev/null; then
+                        warn "  Could not create $vm_pip_name with DNS label '$vm_dns_label' (label taken?) — retrying without label"
+                        az network public-ip create -g "$TARGET_RG" -n "$vm_pip_name" \
+                            -l "$TARGET_REGION" --sku "$vm_pip_sku" --allocation-method Static -o none
+                    fi
+                elif [[ -n "$vm_dns_label" ]]; then
+                    # PIP pre-staged without a label — set it now
+                    az network public-ip update -g "$TARGET_RG" -n "$vm_pip_name" \
+                        --dns-name "$vm_dns_label" -o none 2>/dev/null \
+                        || warn "  Could not set DNS label '$vm_dns_label' on $vm_pip_name"
+                fi
+
                 az network nic ip-config update \
                     --nic-name "$nic_name" \
                     -g "$TARGET_RG" \
                     --name "$primary_ipconfig" \
-                    --public-ip-address "$PIP_NAME" \
+                    --public-ip-address "$vm_pip_name" \
                     -o none 2>/dev/null || warn "  Could not assign public IP to $nic_name/$primary_ipconfig"
-                ok "    Public IP $PIP_NAME assigned to $nic_name/$primary_ipconfig"
+
+                vm_pip_addr=$(az network public-ip show -g "$TARGET_RG" -n "$vm_pip_name" --query ipAddress -o tsv 2>/dev/null || true)
+                vm_pip_fqdn=$(az network public-ip show -g "$TARGET_RG" -n "$vm_pip_name" --query dnsSettings.fqdn -o tsv 2>/dev/null || true)
+                ok "    Public IP $vm_pip_name (${vm_pip_addr:-pending}) assigned to $nic_name/$primary_ipconfig"
+                if [[ -n "$vm_dns_label" ]]; then
+                    ok "    DNS label '$vm_dns_label' — FQDN: ${vm_pip_fqdn:-pending}"
+                    warn "  FQDN region suffix changed (${SOURCE_REGION} → ${TARGET_REGION}) — update anything referencing the old cloudapp FQDN"
+                fi
+                VM_PIP_SUMMARY+=("$vm_name: ${vm_pip_addr:-N/A}  ${vm_pip_fqdn:-(no DNS label)}")
             else
-                detail "    Source NIC $nic_name had no direct PIP — skipping PIP assignment (PIP is on LB frontend)"
+                detail "    Source NIC $nic_name has no direct PIP — skipping PIP assignment (PIP is on LB frontend)"
             fi
 
             # 4c. Add to LB backend pool
@@ -479,7 +570,13 @@ echo ""
 info "Post-failover checklist:"
 echo "  1. Verify LB probes are healthy:"
 echo "     az network lb show -g $TARGET_RG -n $LB_NAME --query 'backendAddressPools[0].loadBalancerBackendAddresses'"
-echo "  2. Cut DNS to new public IP: ${pip_address:-N/A}"
+echo "  2. Cut DNS to new LB public IP: ${pip_address:-N/A}${pip_fqdn:+  ($pip_fqdn)}"
+if [[ ${#VM_PIP_SUMMARY[@]} -gt 0 ]]; then
+    echo "     Per-VM public IPs / FQDNs (region suffix changed — repoint cloudapp FQDN references):"
+    for _line in "${VM_PIP_SUMMARY[@]}"; do
+        echo "       $_line"
+    done
+fi
 echo "  3. Re-enable Boot Integrity Monitoring on ALL VMs:"
 echo "     Azure portal > VM > Security > Enable integrity monitoring"
 echo "  4. Validate end-to-end with real traffic"

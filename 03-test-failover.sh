@@ -19,6 +19,17 @@
 
 set -euo pipefail
 
+# ──────────────────────────── Logging ───────────────────────────
+# Timestamped console output, mirrored (color-stripped) to logs/<script>-<run>.log
+LOG_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/logs"
+mkdir -p "$LOG_DIR"
+LOG_FILE="${LOG_DIR}/$(basename "$0" .sh)-$(date +%Y%m%d-%H%M%S).log"
+exec > >(while IFS= read -r line; do
+    ts=$(date '+%Y-%m-%d %H:%M:%S')
+    printf '[%s] %s\n' "$ts" "$line"
+    printf '[%s] %s\n' "$ts" "$(printf '%s' "$line" | sed $'s/\x1b\\[[0-9;]*m//g')" >> "$LOG_FILE"
+done) 2>&1
+
 # ──────────────────────────── Colors ────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; NC='\033[0m'
 info()    { echo -e "${CYAN}$*${NC}"; }
@@ -42,6 +53,8 @@ Required:
   --source-region REGION        Source region (e.g. eastus)
 
 Optional:
+  --source-rg NAME              Source resource group — copies each VM's PIP DNS
+                                label onto the test PIP
   --test-vnet-name NAME         Test VNet name           (default: vnet-asr-test)
   --test-vnet-cidr CIDR         Test VNet address space  (default: 10.99.0.0/16)
   --test-subnet-cidr CIDR       Test subnet prefix       (default: 10.99.1.0/24)
@@ -64,6 +77,7 @@ TARGET_REGION=""
 VAULT_NAME=""
 VM_NAMES_CSV=""
 SOURCE_REGION=""
+SOURCE_RG=""
 TEST_VNET_NAME="vnet-asr-test"
 TEST_VNET_CIDR="10.99.0.0/16"
 TEST_SUBNET_CIDR="10.99.1.0/24"
@@ -76,6 +90,7 @@ while [[ $# -gt 0 ]]; do
         --vault-name)       VAULT_NAME="$2";         shift 2;;
         --vm-names)         VM_NAMES_CSV="$2";       shift 2;;
         --source-region)    SOURCE_REGION="$2";      shift 2;;
+        --source-rg)        SOURCE_RG="$2";          shift 2;;
         --test-vnet-name)   TEST_VNET_NAME="$2";     shift 2;;
         --test-vnet-cidr)   TEST_VNET_CIDR="$2";     shift 2;;
         --test-subnet-cidr) TEST_SUBNET_CIDR="$2";   shift 2;;
@@ -248,6 +263,33 @@ for i in "${!VM_NAMES[@]}"; do
         -o none
     ok "  $vm_name: PIP $TEST_PIP_NAME attached to $TEST_NIC_NAME"
 
+    # Copy the source PIP DNS label. Labels are unique per region — the test PIP
+    # holds the label in the target region, so cleanup (step 6) must run before
+    # the planned failover can claim it.
+    if [[ -n "$SOURCE_RG" ]]; then
+        src_nic_id=$(az vm show -g "$SOURCE_RG" -n "$vm_name" \
+            --query "networkProfile.networkInterfaces[0].id" -o tsv 2>/dev/null || true)
+        src_pip_id=""
+        # Property casing differs across az CLI versions
+        [[ -n "$src_nic_id" ]] && src_pip_id=$(az network nic show --ids "$src_nic_id" -o json 2>/dev/null \
+            | jq -r '[.ipConfigurations[] | (.publicIPAddress // .publicIpAddress) | select(. != null) | .id][0] // empty' || true)
+        src_label=""
+        [[ -n "$src_pip_id" ]] && src_label=$(az network public-ip show --ids "$src_pip_id" \
+            --query "dnsSettings.domainNameLabel" -o tsv 2>/dev/null || true)
+        if [[ -n "$src_label" && "$src_label" != "None" ]]; then
+            if az network public-ip update -g "$TARGET_RG" -n "$TEST_PIP_NAME" \
+                --dns-name "$src_label" -o none 2>/dev/null; then
+                test_fqdn=$(az network public-ip show -g "$TARGET_RG" -n "$TEST_PIP_NAME" \
+                    --query "dnsSettings.fqdn" -o tsv 2>/dev/null || true)
+                ok "  $vm_name: DNS label '$src_label' — FQDN: ${test_fqdn:-pending}"
+            else
+                warn "Could not set DNS label '$src_label' on $TEST_PIP_NAME (already taken in $TARGET_REGION?)"
+            fi
+        else
+            detail "  $vm_name: source PIP has no DNS label — none set on test PIP"
+        fi
+    fi
+
     # Attach NSG to test NIC (if specified)
     if [[ -n "$TEST_NSG_NAME" ]]; then
         az network nic update \
@@ -296,9 +338,27 @@ for vm_name in "${VM_NAMES[@]}"; do
     ok "  $vm_name: test failover cleanup initiated"
 done
 
-# Wait for cleanup to settle
-info "Waiting for cleanup to complete..."
-sleep 30
+# Cleanup is async — wait until the test NICs are gone before deleting the
+# PIPs/VNet they hold (otherwise the deletes silently fail and the test PIPs
+# keep the DNS labels, blocking the planned-failover PIPs).
+info "Waiting for cleanup to complete (test NICs released)..."
+CLEANUP_TIMEOUT=900
+CLEANUP_START=$SECONDS
+while true; do
+    remaining=0
+    if [[ ${#TEST_NIC_NAMES[@]} -gt 0 ]]; then
+        for test_nic in "${TEST_NIC_NAMES[@]}"; do
+            az network nic show -g "$TARGET_RG" -n "$test_nic" &>/dev/null && remaining=$((remaining + 1))
+        done
+    fi
+    [[ "$remaining" -eq 0 ]] && break
+    if (( SECONDS - CLEANUP_START >= CLEANUP_TIMEOUT )); then
+        warn "Test NICs still present after ${CLEANUP_TIMEOUT}s — PIP/VNet deletion may fail; re-run cleanup later"
+        break
+    fi
+    detail "  $remaining test NIC(s) still present — waiting 20s..."
+    sleep 20
+done
 
 # Verify items are back to normal protection state
 for vm_name in "${VM_NAMES[@]}"; do
@@ -319,14 +379,20 @@ info "Deleting test public IPs..."
 for vm_name in "${VM_NAMES[@]}"; do
     vm_name="$(echo "$vm_name" | xargs)"
     TEST_PIP_NAME="${vm_name}-pip-test"
-    az network public-ip delete -g "$TARGET_RG" -n "$TEST_PIP_NAME" -o none 2>/dev/null || true
-    ok "  Deleted $TEST_PIP_NAME"
+    if az network public-ip delete -g "$TARGET_RG" -n "$TEST_PIP_NAME" -o none 2>/dev/null; then
+        ok "  Deleted $TEST_PIP_NAME"
+    else
+        warn "Could not delete $TEST_PIP_NAME — it may still hold a DNS label needed by 04; delete manually"
+    fi
 done
 
 # ──────────── 7. Delete test VNet ─────────────────────────────
 info "Deleting test VNet: $TEST_VNET_NAME"
-az network vnet delete -g "$TARGET_RG" -n "$TEST_VNET_NAME" -o none 2>/dev/null || true
-ok "Test VNet deleted"
+if az network vnet delete -g "$TARGET_RG" -n "$TEST_VNET_NAME" -o none 2>/dev/null; then
+    ok "Test VNet deleted"
+else
+    warn "Could not delete test VNet $TEST_VNET_NAME — delete manually once cleanup finishes"
+fi
 
 # ──────────── Done ──────────────────────────────────────────────
 echo ""

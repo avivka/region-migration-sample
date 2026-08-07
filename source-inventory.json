@@ -22,13 +22,20 @@
         "nsgOnNic": "nsg-workload",
         "ipConfigurations": [
           {
-            "privateIp": null,
-            "allocation": null,
-            "hasPublicIp": false,
+            "privateIp": "10.0.1.4",
+            "allocation": "Dynamic",
+            "hasPublicIp": true,
+            "publicIpId": "/subscriptions/c64fd005-b880-4802-9aa8-2dcc75068a20/resourceGroups/rg-migration-test-eastus/providers/Microsoft.Network/publicIPAddresses/vm-test-01-pip",
             "subnet": "snet-workload",
             "lbBackends": [
               "/subscriptions/c64fd005-b880-4802-9aa8-2dcc75068a20/resourceGroups/rg-migration-test-eastus/providers/Microsoft.Network/loadBalancers/lb-source/backendAddressPools/bepool"
-            ]
+            ],
+            "publicIp": {
+              "name": "vm-test-01-pip",
+              "sku": "Standard",
+              "dnsLabel": "cu-sip-vm-test-01-avivk8",
+              "fqdn": "cu-sip-vm-test-01-avivk8.eastus.cloudapp.azure.com"
+            }
           }
         ]
       }
@@ -57,13 +64,20 @@
         "nsgOnNic": "nsg-workload",
         "ipConfigurations": [
           {
-            "privateIp": null,
-            "allocation": null,
-            "hasPublicIp": false,
+            "privateIp": "10.0.1.5",
+            "allocation": "Dynamic",
+            "hasPublicIp": true,
+            "publicIpId": "/subscriptions/c64fd005-b880-4802-9aa8-2dcc75068a20/resourceGroups/rg-migration-test-eastus/providers/Microsoft.Network/publicIPAddresses/vm-test-02-pip",
             "subnet": "snet-workload",
             "lbBackends": [
               "/subscriptions/c64fd005-b880-4802-9aa8-2dcc75068a20/resourceGroups/rg-migration-test-eastus/providers/Microsoft.Network/loadBalancers/lb-source/backendAddressPools/bepool"
-            ]
+            ],
+            "publicIp": {
+              "name": "vm-test-02-pip",
+              "sku": "Standard",
+              "dnsLabel": "cu-sip-vm-test-02-avivk8",
+              "fqdn": "cu-sip-vm-test-02-avivk8.eastus.cloudapp.azure.com"
+            }
           }
         ]
       }
@@ -92,13 +106,20 @@
         "nsgOnNic": "nsg-workload",
         "ipConfigurations": [
           {
-            "privateIp": null,
-            "allocation": null,
-            "hasPublicIp": false,
+            "privateIp": "10.0.1.6",
+            "allocation": "Dynamic",
+            "hasPublicIp": true,
+            "publicIpId": "/subscriptions/c64fd005-b880-4802-9aa8-2dcc75068a20/resourceGroups/rg-migration-test-eastus/providers/Microsoft.Network/publicIPAddresses/vm-test-03-pip",
             "subnet": "snet-workload",
             "lbBackends": [
               "/subscriptions/c64fd005-b880-4802-9aa8-2dcc75068a20/resourceGroups/rg-migration-test-eastus/providers/Microsoft.Network/loadBalancers/lb-source/backendAddressPools/bepool"
-            ]
+            ],
+            "publicIp": {
+              "name": "vm-test-03-pip",
+              "sku": "Standard",
+              "dnsLabel": "cu-sip-vm-test-03-avivk8",
+              "fqdn": "cu-sip-vm-test-03-avivk8.eastus.cloudapp.azure.com"
+            }
           }
         ]
       }

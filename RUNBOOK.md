@@ -112,7 +112,7 @@ in the target region.
 3. Trigger **planned failover** per VM (`az site-recovery protected-item planned-failover`).
 4. **Post-failover network wiring** (automated by the script):
    - Associate target NSG to each NIC
-   - Assign new public IP
+   - Recreate each VM's public IP in the target (same name/SKU/DNS label) and attach it
    - Add NICs to LB backend pool
 5. Re-enable **Boot integrity monitoring** on the failed-over VM (ASR does not replicate this state).
 6. Cut DNS / Traffic Manager to the new public IP.
@@ -157,3 +157,7 @@ source is fully live.
 - Boot integrity monitoring state is NOT replicated — re-enable post-failover.
 - Security type (TrustedLaunch), Gen2, Secure Boot, vTPM are preserved by ASR for the VM itself.
 - Public IP address always changes — plan DNS, never hard-coded IPs.
+- PIP DNS labels (VM and LB) are copied by scripts 01/03/04, but the cloudapp FQDN region
+  suffix changes (`<label>.eastus.cloudapp.azure.com` → `<label>.centralus.cloudapp.azure.com`)
+  — repoint anything referencing the full FQDN. A label is unique per region: the test PIP
+  holds it in the target region until test-failover cleanup deletes it.
