@@ -3,9 +3,10 @@
 # 03-test-failover.sh
 # Cross-region ASR migration — Phase 3: Test failover.
 #
-# Mandatory validation step before planned cutover. Creates an isolated test
-# VNet, triggers test failover per VM, waits for completion, prompts the
-# operator to validate (Secure Boot, vTPM, app health), then cleans up.
+# Mandatory validation step before planned cutover. Triggers test failover per VM
+# into the staged target VNet (mirrors source name), waits for completion, prompts
+# the operator to validate (Secure Boot, vTPM, app health), then cleans up the test
+# VMs/NICs/PIPs. The target VNet is left in place (it is the production target).
 #
 # NOTE: The az CLI site-recovery extension does not expose test-failover or
 # test-failover-cleanup subcommands. This script uses `az rest` to call the
@@ -43,7 +44,12 @@ usage() {
     cat <<EOF
 Usage: $(basename "$0") [OPTIONS]
 
-Run ASR test failover for Trusted Launch VMs into an isolated test network.
+Run ASR test failover for Trusted Launch VMs into the staged target VNet.
+
+Test failover uses the target VNet already staged by script 01 (which mirrors the
+source VNet name). The target VNet is not peered to source and has its own address
+space, so the failover stays isolated from the live source. The VNet is left in
+place after cleanup — it is the production target network, not a throwaway.
 
 Required:
   --target-rg NAME              Target resource group (where vault lives)
@@ -55,9 +61,8 @@ Required:
 Optional:
   --source-rg NAME              Source resource group — copies each VM's PIP DNS
                                 label onto the test PIP
-  --test-vnet-name NAME         Test VNet name           (default: vnet-asr-test)
-  --test-vnet-cidr CIDR         Test VNet address space  (default: 10.99.0.0/16)
-  --test-subnet-cidr CIDR       Test subnet prefix       (default: 10.99.1.0/24)
+  --target-vnet NAME            Target VNet to fail over into (default: mirror source VNet name)
+  --target-subnet NAME          Target subnet name       (default: mirror source subnet name)
   --test-nsg-name NAME          NSG to attach to test NICs (optional)
   -h, --help                    Show this help
 
@@ -78,9 +83,8 @@ VAULT_NAME=""
 VM_NAMES_CSV=""
 SOURCE_REGION=""
 SOURCE_RG=""
-TEST_VNET_NAME="vnet-asr-test"
-TEST_VNET_CIDR="10.99.0.0/16"
-TEST_SUBNET_CIDR="10.99.1.0/24"
+TARGET_VNET=""          # default: mirror source VNet name (resolved after args)
+TARGET_SUBNET=""        # default: mirror source subnet name (resolved after args)
 TEST_NSG_NAME=""
 
 while [[ $# -gt 0 ]]; do
@@ -91,9 +95,8 @@ while [[ $# -gt 0 ]]; do
         --vm-names)         VM_NAMES_CSV="$2";       shift 2;;
         --source-region)    SOURCE_REGION="$2";      shift 2;;
         --source-rg)        SOURCE_RG="$2";          shift 2;;
-        --test-vnet-name)   TEST_VNET_NAME="$2";     shift 2;;
-        --test-vnet-cidr)   TEST_VNET_CIDR="$2";     shift 2;;
-        --test-subnet-cidr) TEST_SUBNET_CIDR="$2";   shift 2;;
+        --target-vnet)      TARGET_VNET="$2";        shift 2;;
+        --target-subnet)    TARGET_SUBNET="$2";      shift 2;;
         --test-nsg-name)    TEST_NSG_NAME="$2";      shift 2;;
         -h|--help)          usage;;
         *) err "Unknown argument: $1";;
@@ -113,23 +116,34 @@ SRC_FABRIC="fabric-${SOURCE_REGION}"
 SRC_CONTAINER="container-${SOURCE_REGION}"
 API_VERSION="2025-08-01"
 
-info "== Phase 3: Test Failover =="
-
-# ──────────── 1. Create isolated test VNet ────────────────────
-info "Creating isolated test VNet: $TEST_VNET_NAME"
-
-if ! az network vnet show -g "$TARGET_RG" -n "$TEST_VNET_NAME" &>/dev/null; then
-    az network vnet create \
-        -g "$TARGET_RG" -n "$TEST_VNET_NAME" -l "$TARGET_REGION" \
-        --address-prefix "$TEST_VNET_CIDR" \
-        --subnet-name "snet-test" --subnet-prefix "$TEST_SUBNET_CIDR" \
-        -o none
-    ok "Created test VNet $TEST_VNET_NAME ($TEST_VNET_CIDR) — no connectivity to source"
-else
-    ok "Test VNet $TEST_VNET_NAME already exists"
+# Mirror source VNet/subnet names for the target (same defaults as script 01).
+if [[ -z "$TARGET_VNET" ]]; then
+    if [[ -n "$SOURCE_RG" ]]; then
+        TARGET_VNET=$(az network vnet list -g "$SOURCE_RG" --query "[0].name" -o tsv 2>/dev/null || true)
+    fi
+    [[ -z "$TARGET_VNET" ]] && TARGET_VNET=$(az network vnet list -g "$TARGET_RG" --query "[0].name" -o tsv 2>/dev/null || true)
+fi
+if [[ -z "$TARGET_SUBNET" ]]; then
+    if [[ -n "$SOURCE_RG" ]]; then
+        TARGET_SUBNET=$(az network vnet subnet list -g "$SOURCE_RG" --vnet-name \
+            "$(az network vnet list -g "$SOURCE_RG" --query "[0].name" -o tsv 2>/dev/null)" \
+            --query "[0].name" -o tsv 2>/dev/null || true)
+    fi
+    [[ -z "$TARGET_SUBNET" ]] && TARGET_SUBNET="snet-workload"
 fi
 
-TEST_VNET_ID=$(az network vnet show -g "$TARGET_RG" -n "$TEST_VNET_NAME" --query "id" -o tsv)
+info "== Phase 3: Test Failover =="
+
+# ──────────── 1. Verify target VNet (staged by script 01) ─────
+# Fail over into the real target VNet (mirrors source name); do NOT create a
+# throwaway network and do NOT delete it afterwards — it is the production target.
+info "Using target VNet for test failover: $TARGET_VNET/$TARGET_SUBNET"
+
+if ! az network vnet subnet show -g "$TARGET_RG" --vnet-name "$TARGET_VNET" -n "$TARGET_SUBNET" &>/dev/null; then
+    err "Target VNet '$TARGET_VNET' / subnet '$TARGET_SUBNET' not found in $TARGET_RG — run 01-preflight-and-stage.sh first."
+fi
+
+TEST_VNET_ID=$(az network vnet show -g "$TARGET_RG" -n "$TARGET_VNET" --query "id" -o tsv)
 
 # ──────────── 2. Trigger test failover per VM ─────────────────
 info "Triggering test failover for ${#VM_NAMES[@]} VM(s)..."
@@ -166,6 +180,9 @@ TFO_START=$SECONDS
 # Parallel arrays to store discovered NIC names (bash 3.x compatible)
 TEST_NIC_NAMES=()
 TEST_NIC_VM_NAMES=()
+# Test PIP names chosen per VM (mirror source names) — reused by cleanup
+TEST_PIP_NAMES=()
+TEST_PIP_VM_NAMES=()
 
 all_done=false
 while [[ "$all_done" == false ]]; do
@@ -236,13 +253,31 @@ for i in "${!VM_NAMES[@]}"; do
             break
         fi
     done
-    TEST_PIP_NAME="${vm_name}-pip-test"
-
     # Verify the test NIC was discovered
     if [[ -z "$TEST_NIC_NAME" ]]; then
         warn "No test NIC found for $vm_name — skipping PIP creation"
         continue
     fi
+
+    # Mirror the source per-VM PIP: same name and DNS label (no suffix), so the
+    # test PIP matches production exactly. Labels are unique per region — the test PIP
+    # holds the label until cleanup (step 6) frees it for the planned failover.
+    # (Property casing differs across az CLI versions.)
+    src_pip_id=""; src_pip_name=""; src_label=""
+    if [[ -n "$SOURCE_RG" ]]; then
+        src_nic_id=$(az vm show -g "$SOURCE_RG" -n "$vm_name" \
+            --query "networkProfile.networkInterfaces[0].id" -o tsv 2>/dev/null || true)
+        [[ -n "$src_nic_id" ]] && src_pip_id=$(az network nic show --ids "$src_nic_id" -o json 2>/dev/null \
+            | jq -r '[.ipConfigurations[] | (.publicIPAddress // .publicIpAddress) | select(. != null) | .id][0] // empty' || true)
+        if [[ -n "$src_pip_id" ]]; then
+            src_pip=$(az network public-ip show --ids "$src_pip_id" -o json 2>/dev/null || echo '{}')
+            src_pip_name=$(jq -r '.name // empty' <<<"$src_pip")
+            src_label=$(jq -r '.dnsSettings.domainNameLabel // empty' <<<"$src_pip")
+        fi
+    fi
+    TEST_PIP_NAME="${src_pip_name:-${vm_name}-pip}"
+    TEST_PIP_NAMES+=("$TEST_PIP_NAME")
+    TEST_PIP_VM_NAMES+=("$vm_name")
 
     # Create public IP
     info "  Creating PIP: $TEST_PIP_NAME"
@@ -263,19 +298,8 @@ for i in "${!VM_NAMES[@]}"; do
         -o none
     ok "  $vm_name: PIP $TEST_PIP_NAME attached to $TEST_NIC_NAME"
 
-    # Copy the source PIP DNS label. Labels are unique per region — the test PIP
-    # holds the label in the target region, so cleanup (step 6) must run before
-    # the planned failover can claim it.
+    # Apply the source DNS label to the test PIP
     if [[ -n "$SOURCE_RG" ]]; then
-        src_nic_id=$(az vm show -g "$SOURCE_RG" -n "$vm_name" \
-            --query "networkProfile.networkInterfaces[0].id" -o tsv 2>/dev/null || true)
-        src_pip_id=""
-        # Property casing differs across az CLI versions
-        [[ -n "$src_nic_id" ]] && src_pip_id=$(az network nic show --ids "$src_nic_id" -o json 2>/dev/null \
-            | jq -r '[.ipConfigurations[] | (.publicIPAddress // .publicIpAddress) | select(. != null) | .id][0] // empty' || true)
-        src_label=""
-        [[ -n "$src_pip_id" ]] && src_label=$(az network public-ip show --ids "$src_pip_id" \
-            --query "dnsSettings.domainNameLabel" -o tsv 2>/dev/null || true)
         if [[ -n "$src_label" && "$src_label" != "None" ]]; then
             if az network public-ip update -g "$TARGET_RG" -n "$TEST_PIP_NAME" \
                 --dns-name "$src_label" -o none 2>/dev/null; then
@@ -314,7 +338,7 @@ echo "  [ ] 3. vTPM is enabled:         (same command — check uefiSettings.vTp
 echo "  [ ] 4. Disk controller type matches source (NVMe/SCSI)"
 echo "  [ ] 5. All data disks attached at correct LUNs"
 echo "  [ ] 6. Application health check passes (SSH/RDP, service ports)"
-echo "  [ ] 7. No connectivity leak to source network (test VNet is isolated)"
+echo "  [ ] 7. No connectivity leak to source (target VNet is not peered to source)"
 echo ""
 warn "Do NOT proceed to planned failover until all checks pass."
 echo ""
@@ -375,24 +399,22 @@ for vm_name in "${VM_NAMES[@]}"; do
 done
 
 # ──────────── 6. Delete test PIPs ─────────────────────────────
+# Delete the exact PIP names created above (they mirror the source PIP names, so
+# they MUST be removed to free the name + DNS label for the planned failover).
 info "Deleting test public IPs..."
-for vm_name in "${VM_NAMES[@]}"; do
-    vm_name="$(echo "$vm_name" | xargs)"
-    TEST_PIP_NAME="${vm_name}-pip-test"
-    if az network public-ip delete -g "$TARGET_RG" -n "$TEST_PIP_NAME" -o none 2>/dev/null; then
-        ok "  Deleted $TEST_PIP_NAME"
-    else
-        warn "Could not delete $TEST_PIP_NAME — it may still hold a DNS label needed by 04; delete manually"
-    fi
-done
-
-# ──────────── 7. Delete test VNet ─────────────────────────────
-info "Deleting test VNet: $TEST_VNET_NAME"
-if az network vnet delete -g "$TARGET_RG" -n "$TEST_VNET_NAME" -o none 2>/dev/null; then
-    ok "Test VNet deleted"
-else
-    warn "Could not delete test VNet $TEST_VNET_NAME — delete manually once cleanup finishes"
+if [[ ${#TEST_PIP_NAMES[@]} -gt 0 ]]; then
+    for idx in "${!TEST_PIP_NAMES[@]}"; do
+        TEST_PIP_NAME="${TEST_PIP_NAMES[$idx]}"
+        if az network public-ip delete -g "$TARGET_RG" -n "$TEST_PIP_NAME" -o none 2>/dev/null; then
+            ok "  Deleted $TEST_PIP_NAME"
+        else
+            warn "Could not delete $TEST_PIP_NAME — it may still hold a name/DNS label needed by 04; delete manually"
+        fi
+    done
 fi
+
+# NOTE: the target VNet is intentionally NOT deleted — it is the production
+# target network (staged by script 01), reused as-is by the planned failover.
 
 # ──────────── Done ──────────────────────────────────────────────
 echo ""

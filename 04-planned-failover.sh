@@ -56,8 +56,8 @@ Optional:
   --nsg-name NAME               Target NSG name (default: same name as the source NSG)
   --nsg-rg NAME                 RG holding the target NSG (default: search TARGET_RG then
                                 RG_CORE_<target-region>; NSG often lives in a shared core RG)
-  --public-ip-name NAME         Target public IP name       (default: pip-target-lb)
-  --lb-name NAME                Target Load Balancer name   (default: lb-target)
+  --public-ip-name NAME         Target public IP name       (default: mirror source LB PIP)
+  --lb-name NAME                Target Load Balancer name   (default: mirror source LB)
   --lb-backend-pool NAME        LB backend pool name        (default: bepool)
   --source-inventory PATH       Source inventory JSON        (default: ./source-inventory.json)
   --recovery-plan-name NAME     Recovery plan name          (default: plan-region-migration)
@@ -84,8 +84,8 @@ VAULT_NAME=""
 VM_NAMES_CSV=""
 NSG_NAME=""
 NSG_RG=""
-PIP_NAME="pip-target-lb"
-LB_NAME="lb-target"
+PIP_NAME="pip-workload-lb"
+LB_NAME="lb-workload"
 LB_BACKEND_POOL="bepool"
 INVENTORY_FILE="./source-inventory.json"
 RECOVERY_PLAN_NAME="plan-region-migration"
@@ -132,20 +132,29 @@ done
 
 IFS=',' read -ra VM_NAMES <<< "$VM_NAMES_CSV"
 
+# Target mirrors source resource names verbatim — requires distinct RGs.
+if [[ "$SOURCE_RG" == "$TARGET_RG" ]]; then
+    err "--source-rg and --target-rg must differ: the target mirrors source resource names, which would collide in the same RG."
+fi
+
 SUB_ID=$(az account show --query "id" -o tsv)
 API_VERSION="2025-08-01"
 
-# Derive LB/PIP names from source inventory if not explicitly set
+# Mirror LB/PIP names from source (region migration → identical names in target RG)
 if [[ "$LB_NAME_SET" == false ]] && [[ -f "$INVENTORY_FILE" ]]; then
     src_lb_id=$(jq -r '.[0].nics[0].ipConfigurations[0].lbBackends[0] // empty' "$INVENTORY_FILE")
     if [[ -n "$src_lb_id" ]]; then
         SOURCE_LB=$(echo "$src_lb_id" | awk -F'/loadBalancers/' '{print $2}' | awk -F'/' '{print $1}')
-        LB_NAME="${SOURCE_LB}-target"
+        LB_NAME="$SOURCE_LB"
         LB_BACKEND_POOL=$(echo "$src_lb_id" | awk -F'/backendAddressPools/' '{print $2}')
         if [[ "$PIP_NAME_SET" == false ]]; then
-            PIP_NAME="pip-${SOURCE_LB}-target"
+            # Mirror the source LB frontend PIP name (casing differs across az versions)
+            PIP_NAME=$(az network lb show -g "$SOURCE_RG" -n "$SOURCE_LB" -o json 2>/dev/null \
+                | jq -r '(((.frontendIPConfigurations // .frontendIpConfigurations // [])[0]
+                    | (.publicIPAddress // .publicIpAddress // {}).id) // empty) | split("/") | last')
+            [[ -z "$PIP_NAME" ]] && PIP_NAME="pip-${SOURCE_LB}"
         fi
-        detail "Derived from inventory: LB=$LB_NAME PIP=$PIP_NAME POOL=$LB_BACKEND_POOL"
+        detail "Mirrored from inventory: LB=$LB_NAME PIP=$PIP_NAME POOL=$LB_BACKEND_POOL"
     fi
 fi
 
@@ -424,15 +433,12 @@ if [[ "$SKIP_WIRING" == false ]]; then
                     nsg_search_rgs=("$TARGET_RG" "RG_CORE_${TARGET_REGION}")
                 fi
 
-                # Try the source NSG name first (CX layout: same name in a core RG),
-                # then the "<name>-target" convention used by script 01 staging.
+                # Target NSG mirrors the source name; search tenant RG then core RG.
                 nsg_id=""; nsg_rg_found=""; nsg_name_found=""
                 for cand_rg in "${nsg_search_rgs[@]}"; do
-                    for cand_name in "$target_nsg" "${target_nsg}-target"; do
-                        nsg_id=$(az network nsg show -g "$cand_rg" -n "$cand_name" \
-                            --query "id" -o tsv 2>/dev/null || true)
-                        if [[ -n "$nsg_id" ]]; then nsg_rg_found="$cand_rg"; nsg_name_found="$cand_name"; break 2; fi
-                    done
+                    nsg_id=$(az network nsg show -g "$cand_rg" -n "$target_nsg" \
+                        --query "id" -o tsv 2>/dev/null || true)
+                    if [[ -n "$nsg_id" ]]; then nsg_rg_found="$cand_rg"; nsg_name_found="$target_nsg"; break; fi
                 done
 
                 if [[ -n "$nsg_id" ]]; then
