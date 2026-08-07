@@ -28,6 +28,17 @@
 
 set -euo pipefail
 
+# ──────────────────────────── Logging ───────────────────────────
+# Timestamped console output, mirrored (color-stripped) to logs/<script>-<run>.log
+LOG_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/logs"
+mkdir -p "$LOG_DIR"
+LOG_FILE="${LOG_DIR}/$(basename "$0" .sh)-$(date +%Y%m%d-%H%M%S).log"
+exec > >(while IFS= read -r line; do
+    ts=$(date '+%Y-%m-%d %H:%M:%S')
+    printf '[%s] %s\n' "$ts" "$line"
+    printf '[%s] %s\n' "$ts" "$(printf '%s' "$line" | sed $'s/\x1b\\[[0-9;]*m//g')" >> "$LOG_FILE"
+done) 2>&1
+
 # ──────────────────────────── Colors ────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; NC='\033[0m'
 info()    { echo -e "${CYAN}$*${NC}"; }
@@ -152,13 +163,31 @@ for vm_name in "${VM_NAMES[@]}"; do
         nsg_on_nic=$(echo "$nic_json" | jq -r '.networkSecurityGroup.id // empty' | awk -F'/' '{print $NF}')
         [[ -z "$nsg_on_nic" ]] && nsg_on_nic="null"
 
+        # Property casing differs across az CLI versions (publicIpAddress vs publicIPAddress)
         ip_configs=$(echo "$nic_json" | jq '[.ipConfigurations[] | {
-            privateIp: .privateIpAddress,
-            allocation: .privateIpAllocationMethod,
-            hasPublicIp: (.publicIpAddress != null),
+            privateIp: (.privateIPAddress // .privateIpAddress),
+            allocation: (.privateIPAllocationMethod // .privateIpAllocationMethod),
+            hasPublicIp: ((.publicIPAddress // .publicIpAddress) != null),
+            publicIpId: ((.publicIPAddress // .publicIpAddress // {}).id),
             subnet: (.subnet.id | split("/") | last),
             lbBackends: [.loadBalancerBackendAddressPools[]?.id]
         }]')
+
+        # ASR does not replicate PIPs — capture name/SKU/DNS label so script 04
+        # can recreate them in the target.
+        for pip_id in $(echo "$ip_configs" | jq -r '.[].publicIpId // empty'); do
+            pip_json=$(az network public-ip show --ids "$pip_id" -o json 2>/dev/null || echo '{}')
+            pip_entry=$(echo "$pip_json" | jq '{
+                name: .name,
+                sku: (.sku.name // "Standard"),
+                dnsLabel: (.dnsSettings.domainNameLabel // null),
+                fqdn: (.dnsSettings.fqdn // null)
+            }')
+            ip_configs=$(echo "$ip_configs" | jq --arg id "$pip_id" --argjson pip "$pip_entry" \
+                'map(if .publicIpId == $id then . + {publicIp: $pip} else . end)')
+            pip_label=$(echo "$pip_entry" | jq -r '.dnsLabel // empty')
+            [[ -n "$pip_label" ]] && detail "  NIC $nic_name: direct PIP with DNS label '$pip_label' — FQDN region suffix changes after failover"
+        done
 
         nic_entry=$(jq -n \
             --arg name "$nic_name" \
@@ -331,8 +360,9 @@ if [[ "$USE_RESOURCE_MOVER" == true ]]; then
     SOURCE_PIP_NAME=""
     if [[ -n "${SOURCE_LB_ID:-}" ]]; then
         SOURCE_LB_NAME=$(echo "$SOURCE_LB_ID" | awk -F'/loadBalancers/' '{print $2}' | awk -F'/' '{print $1}')
-        SOURCE_PIP_NAME=$(az network lb show -g "$SOURCE_RG" -n "$SOURCE_LB_NAME" \
-            --query "frontendIpConfigurations[0].publicIpAddress.id" -o tsv 2>/dev/null \
+        SOURCE_PIP_NAME=$(az network lb show -g "$SOURCE_RG" -n "$SOURCE_LB_NAME" -o json 2>/dev/null \
+            | jq -r '((.frontendIPConfigurations // .frontendIpConfigurations // [])[0]
+                | (.publicIPAddress // .publicIpAddress // {}).id) // empty' \
             | awk -F'/' '{print $NF}' || true)
     fi
     if [[ -z "$SOURCE_PIP_NAME" ]]; then
@@ -578,32 +608,122 @@ else
 fi
 
 # ──────────── 7. Target Load Balancer ───────────────────────────
+# Mirror source LB frontend/backend pool names and frontend PIP DNS label.
+# Property casing differs across az CLI versions.
+SRC_LB_FE_NAME="fe"
+SRC_LB_LABEL=""
+src_lb_json='{}'
+if [[ -n "${SOURCE_LB:-}" ]]; then
+    src_lb_json=$(az network lb show -g "$SOURCE_RG" -n "$SOURCE_LB" -o json 2>/dev/null || echo '{}')
+    SRC_LB_FE_NAME=$(echo "$src_lb_json" | jq -r \
+        '(.frontendIPConfigurations // .frontendIpConfigurations // [])[0].name // "fe"')
+    src_lb_pip_id=$(echo "$src_lb_json" | jq -r '(((.frontendIPConfigurations // .frontendIpConfigurations // [])[0]
+        | (.publicIPAddress // .publicIpAddress // {}).id) // empty)')
+    [[ -n "$src_lb_pip_id" ]] && SRC_LB_LABEL=$(az network public-ip show --ids "$src_lb_pip_id" \
+        --query "dnsSettings.domainNameLabel" -o tsv 2>/dev/null || true)
+fi
+TARGET_BEPOOL="${SOURCE_BEPOOL:-bepool}"
+
+if [[ -n "$SRC_LB_LABEL" && "$SRC_LB_LABEL" != "None" ]]; then
+    az network public-ip update -g "$TARGET_RG" -n "$PIP_NAME" \
+        --dns-name "$SRC_LB_LABEL" -o none 2>/dev/null \
+        && ok "DNS label '$SRC_LB_LABEL' set on $PIP_NAME (FQDN region suffix changes at cutover)" \
+        || warn "Could not set DNS label '$SRC_LB_LABEL' on $PIP_NAME"
+fi
+
+LB_CREATED=false
 if ! az network lb show -g "$TARGET_RG" -n "$LB_NAME" &>/dev/null; then
     az network lb create \
         -g "$TARGET_RG" -n "$LB_NAME" -l "$TARGET_REGION" \
         --sku Standard \
         --public-ip-address "$PIP_NAME" \
-        --frontend-ip-name "fe" \
-        --backend-pool-name "bepool" \
+        --frontend-ip-name "$SRC_LB_FE_NAME" \
+        --backend-pool-name "$TARGET_BEPOOL" \
         -o none
+    LB_CREATED=true
+    ok "Created target Load Balancer $LB_NAME (frontend=$SRC_LB_FE_NAME pool=$TARGET_BEPOOL)"
+else
+    ok "Target Load Balancer $LB_NAME already exists"
+fi
 
+# Clone probes and rules 1:1 from the source LB (Resource Mover cannot move
+# public LBs, so the target is recreated — config must match the source).
+if [[ "$(echo "$src_lb_json" | jq -r '.name // empty')" != "" ]]; then
+    tgt_lb_json=$(az network lb show -g "$TARGET_RG" -n "$LB_NAME" -o json)
+
+    # Drop target rules/probes that don't exist on the source (rules first — they reference probes)
+    for r_name in $(echo "$tgt_lb_json" | jq -r '(.loadBalancingRules // [])[].name'); do
+        echo "$src_lb_json" | jq -e --arg n "$r_name" \
+            '(.loadBalancingRules // [])[] | select(.name == $n)' >/dev/null || {
+            az network lb rule delete -g "$TARGET_RG" --lb-name "$LB_NAME" -n "$r_name" -o none 2>/dev/null || true
+            detail "  Removed target rule $r_name (not on source LB)"
+        }
+    done
+    for p_name in $(echo "$tgt_lb_json" | jq -r '(.probes // [])[].name'); do
+        echo "$src_lb_json" | jq -e --arg n "$p_name" \
+            '(.probes // [])[] | select(.name == $n)' >/dev/null || {
+            az network lb probe delete -g "$TARGET_RG" --lb-name "$LB_NAME" -n "$p_name" -o none 2>/dev/null || true
+            detail "  Removed target probe $p_name (not on source LB)"
+        }
+    done
+
+    while IFS= read -r probe; do
+        [[ -z "$probe" ]] && continue
+        p_name=$(jq -r '.name' <<<"$probe")
+        p_args=(-g "$TARGET_RG" --lb-name "$LB_NAME" -n "$p_name"
+                --protocol "$(jq -r '.protocol' <<<"$probe")"
+                --port "$(jq -r '.port' <<<"$probe")"
+                --interval "$(jq -r '.intervalInSeconds // 5' <<<"$probe")"
+                --threshold "$(jq -r '.numberOfProbes // 2' <<<"$probe")")
+        p_path=$(jq -r '.requestPath // empty' <<<"$probe")
+        [[ -n "$p_path" ]] && p_args+=(--path "$p_path")
+        if az network lb probe show -g "$TARGET_RG" --lb-name "$LB_NAME" -n "$p_name" &>/dev/null; then
+            az network lb probe update "${p_args[@]}" -o none 2>/dev/null || warn "Could not update probe $p_name"
+        else
+            az network lb probe create "${p_args[@]}" -o none 2>/dev/null || warn "Could not create probe $p_name"
+        fi
+        ok "  Probe $p_name mirrored from source"
+    done < <(echo "$src_lb_json" | jq -c '(.probes // [])[]')
+
+    while IFS= read -r rule; do
+        [[ -z "$rule" ]] && continue
+        r_name=$(jq -r '.name' <<<"$rule")
+        r_pool=$(jq -r '(.backendAddressPool.id // (.backendAddressPools // [])[0].id // empty) | split("/") | last' <<<"$rule")
+        [[ -z "$r_pool" ]] && r_pool="$TARGET_BEPOOL"
+        r_probe=$(jq -r '(.probe.id // empty) | split("/") | last' <<<"$rule")
+        r_args=(-g "$TARGET_RG" --lb-name "$LB_NAME" -n "$r_name"
+                --protocol "$(jq -r '.protocol' <<<"$rule")"
+                --frontend-port "$(jq -r '.frontendPort' <<<"$rule")"
+                --backend-port "$(jq -r '.backendPort' <<<"$rule")"
+                --frontend-ip-name "$SRC_LB_FE_NAME"
+                --backend-pool-name "$r_pool"
+                --idle-timeout "$(jq -r '.idleTimeoutInMinutes // 4' <<<"$rule")"
+                --floating-ip "$(jq -r '.enableFloatingIP // false' <<<"$rule")"
+                --enable-tcp-reset "$(jq -r '.enableTcpReset // false' <<<"$rule")"
+                --load-distribution "$(jq -r '.loadDistribution // "Default"' <<<"$rule")")
+        [[ -n "$r_probe" ]] && r_args+=(--probe-name "$r_probe")
+        if az network lb rule show -g "$TARGET_RG" --lb-name "$LB_NAME" -n "$r_name" &>/dev/null; then
+            az network lb rule update "${r_args[@]}" -o none 2>/dev/null || warn "Could not update rule $r_name"
+        else
+            az network lb rule create "${r_args[@]}" -o none 2>/dev/null || warn "Could not create rule $r_name"
+        fi
+        ok "  Rule $r_name mirrored from source"
+    done < <(echo "$src_lb_json" | jq -c '(.loadBalancingRules // [])[]')
+elif [[ "$LB_CREATED" == true ]]; then
+    # No source LB visible — fall back to a basic probe/rule
     az network lb probe create \
         -g "$TARGET_RG" --lb-name "$LB_NAME" \
         -n "tcp-probe" --protocol Tcp --port 80 \
         --interval 5 --threshold 2 \
         -o none
-
     az network lb rule create \
         -g "$TARGET_RG" --lb-name "$LB_NAME" \
         -n "rule-80" --protocol Tcp \
         --frontend-port 80 --backend-port 80 \
-        --frontend-ip-name "fe" --backend-pool-name "bepool" \
+        --frontend-ip-name "$SRC_LB_FE_NAME" --backend-pool-name "$TARGET_BEPOOL" \
         --probe-name "tcp-probe" \
         -o none
-
-    ok "Created target Load Balancer $LB_NAME"
-else
-    ok "Target Load Balancer $LB_NAME already exists"
+    warn "Source LB not found — created default tcp-probe/rule-80; adjust to match production"
 fi
 
 # ──────────── 8. Recovery Services vault ────────────────────────
