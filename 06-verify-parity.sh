@@ -46,7 +46,7 @@ Required:
 
 Optional:
   --source-lb NAME              Source LB name (default: derived from source NICs)
-  --target-lb NAME              Target LB name (default: <source-lb>-target)
+  --target-lb NAME              Target LB name (default: same as source LB)
   -h, --help                    Show this help
 EOF
     exit 0
@@ -185,7 +185,7 @@ if [[ -z "$SOURCE_LB" ]]; then
     SOURCE_LB=$(az network lb list -g "$SOURCE_RG" --query "[0].name" -o tsv 2>/dev/null || true)
 fi
 if [[ -n "$SOURCE_LB" ]]; then
-    [[ -z "$TARGET_LB" ]] && TARGET_LB="${SOURCE_LB}-target"
+    [[ -z "$TARGET_LB" ]] && TARGET_LB="$SOURCE_LB"
     info ""
     info "── LB: $SOURCE_LB vs $TARGET_LB ──"
     src_lb=$(az network lb show -g "$SOURCE_RG" -n "$SOURCE_LB" -o json 2>/dev/null || echo '{}')
