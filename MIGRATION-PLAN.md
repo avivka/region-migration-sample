@@ -53,8 +53,10 @@ use the manual snapshot fallback `99-manual-snapshot-migration.sh`).
 | vm-test-02 | Standard_D8ds_v6 | 32 GB | TrustedLaunch (SB + vTPM) | NVMe | 1 × PremiumV2_LRS (LUN 0) |
 | vm-test-03 | Standard_D2ds_v6 | 8 GB | TrustedLaunch (SB + vTPM) | NVMe | 1 × Premium_LRS (LUN 0) |
 
-Plus: VNet + subnets, NSGs (`nsg-workload`), NICs, Load Balancer (`lb-source` → `lb-target`,
-backend pool `bepool`), new target-region public IP, Recovery Services vault.
+Plus: VNet + subnets, NSGs (`nsg-workload`), NICs, Load Balancer (name mirrored source → target,
+backend pool `bepool`), new target-region public IP (same name + DNS label as source), Recovery
+Services vault. **All destination resources keep the source names verbatim** (region migration —
+only the region and IP addresses change); this requires source and target to be in different RGs.
 
 ### Division of labor
 
@@ -172,7 +174,7 @@ pinned to the IP breaks silently.
 
 ### 6.3 Cutover mechanics (during the C-day window)
 
-1. Script 04 outputs the new centralus public IP (`pip-target-lb` on `lb-target`).
+1. Script 04 outputs the new centralus public IP (LB PIP keeps the source name, e.g. `pip-source-lb`).
 2. Update A records to the new IP (or repoint CNAME / swap Traffic Manager endpoint priority if fronted).
 3. With 60s TTL, client convergence is minutes; validate resolution from several resolvers and a client on a different network.
 4. Watch source LB metrics — traffic to the old IP should decay to ~zero. Residual traffic after 1h = a cached resolver or a pinned client; chase it before decommission.

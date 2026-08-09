@@ -61,7 +61,7 @@ Required:
   --vm-names VM1,VM2,...        Comma-separated list of VM names
 
 Optional:
-  --target-vnet NAME            Target VNet name            (default: vnet-target)
+  --target-vnet NAME            Target VNet name            (default: mirror source VNet name)
   --target-vnet-cidr CIDR       Target VNet address space   (default: 10.1.0.0/16)
   --target-subnet NAME          Target subnet name          (default: snet-workload)
   --target-subnet-cidr CIDR     Target subnet prefix        (default: 10.1.1.0/24)
@@ -88,7 +88,7 @@ TARGET_RG=""
 TARGET_REGION=""
 VAULT_NAME=""
 VM_NAMES_CSV=""
-TARGET_VNET="vnet-target"
+TARGET_VNET=""          # default: mirror the source VNet name (resolved after args)
 TARGET_VNET_CIDR="10.1.0.0/16"
 TARGET_SUBNET="snet-workload"
 TARGET_SUBNET_CIDR="10.1.1.0/24"
@@ -126,6 +126,18 @@ done
 
 # Split comma-separated VM names into array
 IFS=',' read -ra VM_NAMES <<< "$VM_NAMES_CSV"
+
+# Region migration mirrors source names into the target RG verbatim (no suffixes).
+# That only works if source and target live in different resource groups.
+if [[ "$SOURCE_RG" == "$TARGET_RG" ]]; then
+    err "--source-rg and --target-rg must differ: the target mirrors source resource names, which would collide in the same RG."
+fi
+
+# Default the target VNet name to the source VNet name (mirror source).
+if [[ -z "$TARGET_VNET" ]]; then
+    TARGET_VNET=$(az network vnet list -g "$SOURCE_RG" --query "[0].name" -o tsv 2>/dev/null || true)
+    [[ -z "$TARGET_VNET" ]] && TARGET_VNET="vnet-workload"
+fi
 
 info "== Phase 0/1: Pre-flight inventory + target staging =="
 
@@ -235,17 +247,21 @@ done
 echo "$inventory_json" | jq '.' > "$INVENTORY_OUT"
 ok "Inventory written to $INVENTORY_OUT"
 
-# Derive LB/PIP names from source inventory
+# Mirror LB/PIP names from source (region migration → identical names in target RG)
 SOURCE_LB_ID=$(echo "$inventory_json" | jq -r '.[0].nics[0].ipConfigurations[0].lbBackends[0] // empty')
 if [[ -n "$SOURCE_LB_ID" ]]; then
     SOURCE_LB=$(echo "$SOURCE_LB_ID" | awk -F'/loadBalancers/' '{print $2}' | awk -F'/' '{print $1}')
     SOURCE_BEPOOL=$(echo "$SOURCE_LB_ID" | awk -F'/backendAddressPools/' '{print $2}')
-    LB_NAME="${SOURCE_LB}-target"
-    PIP_NAME="pip-${SOURCE_LB}-target"
-    detail "Derived from source inventory: LB=$LB_NAME PIP=$PIP_NAME POOL=$SOURCE_BEPOOL"
+    LB_NAME="$SOURCE_LB"
+    # Mirror the source LB frontend PIP name (casing differs across az CLI versions)
+    PIP_NAME=$(az network lb show -g "$SOURCE_RG" -n "$SOURCE_LB" -o json 2>/dev/null \
+        | jq -r '(((.frontendIPConfigurations // .frontendIpConfigurations // [])[0]
+            | (.publicIPAddress // .publicIpAddress // {}).id) // empty) | split("/") | last')
+    [[ -z "$PIP_NAME" ]] && PIP_NAME="pip-${SOURCE_LB}"
+    detail "Mirrored from source: LB=$LB_NAME PIP=$PIP_NAME POOL=$SOURCE_BEPOOL"
 else
-    LB_NAME="lb-target"
-    PIP_NAME="pip-target-lb"
+    LB_NAME="lb-workload"
+    PIP_NAME="pip-workload-lb"
     detail "No source LB found in inventory — using defaults: LB=$LB_NAME PIP=$PIP_NAME"
 fi
 
@@ -339,7 +355,7 @@ if [[ "$USE_RESOURCE_MOVER" == true ]]; then
 
     # ── 4c. Add NSGs as move resources ──
     for src_nsg_name in $source_nsg_names; do
-        tgt_nsg_name="${src_nsg_name}-target"
+        tgt_nsg_name="${src_nsg_name}"
         src_nsg_id=$(az network nsg show -g "$SOURCE_RG" -n "$src_nsg_name" --query "id" -o tsv)
 
         info "  Adding NSG $src_nsg_name → $tgt_nsg_name"
@@ -491,8 +507,8 @@ if [[ "$USE_RESOURCE_MOVER" == true ]]; then
     fi
 
     # Re-associate NSG with subnet (Resource Mover may not preserve this)
-    first_tgt_nsg="${source_nsg_names%% *}-target"
-    if [[ -n "$first_tgt_nsg" ]] && [[ "$first_tgt_nsg" != "-target" ]]; then
+    first_tgt_nsg="${source_nsg_names%% *}"
+    if [[ -n "$first_tgt_nsg" ]]; then
         az network vnet subnet update \
             -g "$TARGET_RG" --vnet-name "$TARGET_VNET" -n "$TARGET_SUBNET" \
             --network-security-group "$first_tgt_nsg" -o none 2>/dev/null || true
@@ -536,7 +552,7 @@ else
     info "Replicating source NSGs to target..."
 
     for src_nsg_name in $source_nsg_names; do
-        tgt_nsg_name="${src_nsg_name}-target"
+        tgt_nsg_name="${src_nsg_name}"
 
         if az network nsg show -g "$TARGET_RG" -n "$tgt_nsg_name" &>/dev/null; then
             ok "  Target NSG $tgt_nsg_name already exists — skipping"
@@ -587,8 +603,8 @@ else
     done
 
     # Associate first target NSG with subnet (if only one NSG — adjust if multiple)
-    first_tgt_nsg="${source_nsg_names%% *}-target"
-    if [[ -n "$first_tgt_nsg" ]] && [[ "$first_tgt_nsg" != "-target" ]]; then
+    first_tgt_nsg="${source_nsg_names%% *}"
+    if [[ -n "$first_tgt_nsg" ]]; then
         az network vnet subnet update \
             -g "$TARGET_RG" --vnet-name "$TARGET_VNET" -n "$TARGET_SUBNET" \
             --network-security-group "$first_tgt_nsg" -o none 2>/dev/null || true
