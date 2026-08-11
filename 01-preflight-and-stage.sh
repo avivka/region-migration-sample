@@ -88,10 +88,10 @@ TARGET_RG=""
 TARGET_REGION=""
 VAULT_NAME=""
 VM_NAMES_CSV=""
-TARGET_VNET=""          # default: mirror the source VNet name (resolved after args)
-TARGET_VNET_CIDR="10.1.0.0/16"
-TARGET_SUBNET="snet-workload"
-TARGET_SUBNET_CIDR="10.1.1.0/24"
+TARGET_VNET=""          # default: mirror source VNet name          (resolved after args)
+TARGET_VNET_CIDR=""     # default: mirror source VNet address space  (resolved after args)
+TARGET_SUBNET=""        # default: mirror source subnet name         (resolved after args)
+TARGET_SUBNET_CIDR=""   # default: mirror source subnet prefix       (resolved after args)
 INVENTORY_OUT="./source-inventory.json"
 USE_RESOURCE_MOVER=false
 MOVE_COLLECTION_NAME="mc-region-migration"
@@ -133,11 +133,28 @@ if [[ "$SOURCE_RG" == "$TARGET_RG" ]]; then
     err "--source-rg and --target-rg must differ: the target mirrors source resource names, which would collide in the same RG."
 fi
 
-# Default the target VNet name to the source VNet name (mirror source).
-if [[ -z "$TARGET_VNET" ]]; then
-    TARGET_VNET=$(az network vnet list -g "$SOURCE_RG" --query "[0].name" -o tsv 2>/dev/null || true)
-    [[ -z "$TARGET_VNET" ]] && TARGET_VNET="vnet-workload"
+# Mirror the source network layout into the target: VNet name + address space and
+# the workload subnet name + prefix are copied verbatim from the source. This keeps
+# the target private-IP range identical to the source (e.g. 192.168.1.0/24), which —
+# together with the static-IP pinning in script 02 — lets each VM keep its exact
+# source private IP after failover (required by IP-pinned apps like OpenSearch).
+src_vnet_json=$(az network vnet list -g "$SOURCE_RG" -o json 2>/dev/null || echo '[]')
+src_vnet_name=$(echo "$src_vnet_json" | jq -r '.[0].name // empty')
+[[ -z "$TARGET_VNET" ]] && TARGET_VNET="${src_vnet_name:-vnet-workload}"
+if [[ -z "$TARGET_VNET_CIDR" ]]; then
+    TARGET_VNET_CIDR=$(echo "$src_vnet_json" | jq -r '.[0].addressSpace.addressPrefixes[0] // empty')
+    [[ -z "$TARGET_VNET_CIDR" ]] && TARGET_VNET_CIDR="10.1.0.0/16"
 fi
+# Mirror the source workload subnet (the one the first VM's NIC sits in).
+if [[ -z "$TARGET_SUBNET" || -z "$TARGET_SUBNET_CIDR" ]]; then
+    src_subnet_json=$(echo "$src_vnet_json" | jq -c '.[0].subnets[0] // {}')
+    [[ -z "$TARGET_SUBNET" ]] && TARGET_SUBNET=$(echo "$src_subnet_json" | jq -r '.name // "snet-workload"')
+    if [[ -z "$TARGET_SUBNET_CIDR" ]]; then
+        TARGET_SUBNET_CIDR=$(echo "$src_subnet_json" | jq -r '(.addressPrefix // .addressPrefixes[0]) // empty')
+        [[ -z "$TARGET_SUBNET_CIDR" ]] && TARGET_SUBNET_CIDR="10.1.1.0/24"
+    fi
+fi
+detail "Target network mirrors source: VNet=$TARGET_VNET ($TARGET_VNET_CIDR) subnet=$TARGET_SUBNET ($TARGET_SUBNET_CIDR)"
 
 info "== Phase 0/1: Pre-flight inventory + target staging =="
 

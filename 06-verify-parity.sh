@@ -140,8 +140,8 @@ for vm_name in "${VM_NAMES[@]}"; do
     tgt_nic=$(az network nic show --ids "$tgt_nic_id" -o json)
 
     compare "nic.subnet" "$(jq -r "$NIC_NORM | .subnet" <<<"$src_nic")" "$(jq -r "$NIC_NORM | .subnet" <<<"$tgt_nic")"
-    compare "nic.privateIp" "$(jq -r "$NIC_NORM | .privateIp" <<<"$src_nic")" "$(jq -r "$NIC_NORM | .privateIp" <<<"$tgt_nic")" \
-            "different VNet address space"
+    # Private IP must be retained (target range mirrors source + static IP pinning)
+    compare "nic.privateIp" "$(jq -r "$NIC_NORM | .privateIp" <<<"$src_nic")" "$(jq -r "$NIC_NORM | .privateIp" <<<"$tgt_nic")"
     compare "nic.nsg" "$(jq -r "$NIC_NORM | .nsg" <<<"$src_nic")" "$(jq -r "$NIC_NORM | .nsg" <<<"$tgt_nic")"
     compare "nic.pip" "$(jq -r "$NIC_NORM | .pip" <<<"$src_nic")" "$(jq -r "$NIC_NORM | .pip" <<<"$tgt_nic")"
     compare "nic.lbPools" "$(jq -Sc "$NIC_NORM | .lbPools" <<<"$src_nic")" "$(jq -Sc "$NIC_NORM | .lbPools" <<<"$tgt_nic")"
@@ -174,10 +174,10 @@ for vm_name in "${VM_NAMES[@]}"; do
     # Subnet address prefix
     src_subnet_id=$(jq -r '.ipConfigurations[0].subnet.id' <<<"$src_nic")
     tgt_subnet_id=$(jq -r '.ipConfigurations[0].subnet.id' <<<"$tgt_nic")
+    # Subnet prefix must match source (target range mirrors source)
     compare "subnet.prefix" \
         "$(az network vnet subnet show --ids "$src_subnet_id" -o json | jq -Sc '.addressPrefix // .addressPrefixes')" \
-        "$(az network vnet subnet show --ids "$tgt_subnet_id" -o json | jq -Sc '.addressPrefix // .addressPrefixes')" \
-        "different VNet address space"
+        "$(az network vnet subnet show --ids "$tgt_subnet_id" -o json | jq -Sc '.addressPrefix // .addressPrefixes')"
 done
 
 # ──────────── Load balancer comparison ──────────────────────────

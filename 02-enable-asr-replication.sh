@@ -774,6 +774,62 @@ else
     echo "    --fabric-name $SRC_FABRIC --protection-container $SRC_CONTAINER -o table"
 fi
 
+# ──────────── 9. Pin recovery private IPs to the source IPs ───────
+# IP-pinned apps (e.g. OpenSearch) require the failed-over VM to keep its exact
+# source private IP. ASR defaults the recovery NIC to Dynamic, so we PATCH each
+# protected item's NIC ipConfigs: recoveryStaticIPAddress = the source IP (already
+# stored on the item as staticIPAddress). tfo* fields do the same for test failover.
+# Requires the target subnet to contain that IP — script 01 mirrors the source range.
+info "Pinning recovery private IPs to match source (static assignment)..."
+for vm_name in "${VM_NAMES[@]}"; do
+    vm_name="$(echo "$vm_name" | xargs)"
+    ITEM_NAME="asr-${vm_name}"
+    item_uri="${ASR_BASE_URI}/replicationFabrics/${SRC_FABRIC}/replicationProtectionContainers/${SRC_CONTAINER}/replicationProtectedItems/${ITEM_NAME}?api-version=${ASR_API_VERSION}"
+
+    # Wait for ASR to populate vmNics (with the source staticIPAddress) after enablement.
+    vm_nics="[]"
+    for _ in $(seq 1 20); do
+        item_json=$(az rest --method get --uri "$item_uri" -o json 2>/dev/null || echo '{}')
+        vm_nics=$(echo "$item_json" | jq -c '.properties.providerSpecificDetails.vmNics // []')
+        [[ "$(echo "$vm_nics" | jq 'length')" != "0" ]] && break
+        sleep 15
+    done
+    if [[ "$(echo "$vm_nics" | jq 'length')" == "0" ]]; then
+        warn "  $vm_name: no NIC config discovered yet — private IP not pinned; re-run or set it before failover"
+        continue
+    fi
+
+    # Build the NIC update, copying each ipConfig's source IP into the recovery/tfo static fields.
+    nic_update=$(echo "$vm_nics" | jq '[.[] | {
+        nicId: .nicId,
+        ipConfigs: [ .ipConfigs[]
+            | select((.staticIPAddress // "") != "")
+            | {
+                ipConfigName: .name,
+                isPrimary: (.isPrimary // true),
+                recoverySubnetName: .recoverySubnetName,
+                recoveryStaticIPAddress: .staticIPAddress,
+                tfoSubnetName: .recoverySubnetName,
+                tfoStaticIPAddress: .staticIPAddress
+              } ]
+    } | select((.ipConfigs | length) > 0)]')
+
+    if [[ "$(echo "$nic_update" | jq 'length')" == "0" ]]; then
+        detail "  $vm_name: no source static IP to pin — leaving dynamic"
+        continue
+    fi
+
+    patch_body=$(jq -n --argjson nics "$nic_update" \
+        '{properties: {providerSpecificDetails: {instanceType: "A2A"}, vmNics: $nics}}')
+
+    if az rest --method patch --uri "$item_uri" --body "$patch_body" -o none 2>/dev/null; then
+        pinned=$(echo "$nic_update" | jq -r '[.[].ipConfigs[].recoveryStaticIPAddress] | join(", ")')
+        ok "  $vm_name: recovery private IP pinned to source ($pinned)"
+    else
+        warn "  $vm_name: could not pin recovery private IP — set it in the portal before failover"
+    fi
+done
+
 # ──────────── Done ──────────────────────────────────────────────
 echo ""
 info "== Replication enablement complete. =="
