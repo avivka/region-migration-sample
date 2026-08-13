@@ -50,12 +50,24 @@ Optional:
   --force                       Skip confirmation prompt
   -h, --help                    Show this help
 
+Source-side stale-ASR cleanup (makes a re-triggered initial replication start clean
+and fast — avoids the "orphaned snapshots"/"resync failed"/151083 slow-sync issue):
+  --source-rg NAME              Source resource group — enables source cleanup.
+                                VMs are auto-discovered from this RG.
+  --vm-names VM1,VM2,...        Optional filter — limit cleanup to these VMs
+                                (default: every VM in the source RG)
+  --deep-clean                  Also remove the in-guest mobility agent and REBOOT
+                                each source VM (definitive fix; disruptive — the VM
+                                restarts, so only use when the source can take it)
+
 Example:
   $(basename "$0") \\
     --target-rg rg-migration-test-centralus \\
     --target-region centralus \\
     --vault-name vault-asr-test-centralus \\
-    --source-region eastus --force
+    --source-region eastus \\
+    --source-rg rg-migration-test-eastus --vm-names "vm-test-01,vm-test-02" \\
+    --deep-clean --force
 EOF
     exit 0
 }
@@ -65,6 +77,9 @@ TARGET_RG=""
 TARGET_REGION=""
 VAULT_NAME=""
 SOURCE_REGION=""
+SOURCE_RG=""
+VM_NAMES_CSV=""
+DEEP_CLEAN=false
 FORCE=false
 
 while [[ $# -gt 0 ]]; do
@@ -73,6 +88,9 @@ while [[ $# -gt 0 ]]; do
         --target-region)  TARGET_REGION="$2";    shift 2;;
         --vault-name)     VAULT_NAME="$2";       shift 2;;
         --source-region)  SOURCE_REGION="$2";    shift 2;;
+        --source-rg)      SOURCE_RG="$2";        shift 2;;
+        --vm-names)       VM_NAMES_CSV="$2";     shift 2;;
+        --deep-clean)     DEEP_CLEAN=true;       shift;;
         --force)          FORCE=true;            shift;;
         -h|--help)        usage;;
         *) err "Unknown argument: $1";;
@@ -81,6 +99,9 @@ done
 
 [[ -z "$TARGET_RG" ]]     && err "--target-rg is required"
 [[ -z "$TARGET_REGION" ]] && err "--target-region is required"
+
+# Subscription id — used by ASR cleanup and the source-side stale-config script.
+SUB_ID=$(az account show --query "id" -o tsv)
 
 # ──────────────────────── Confirmation ──────────────────────────
 info "== Reset Target: $TARGET_RG =="
@@ -357,6 +378,125 @@ for acct in $accounts; do
     az storage account delete -g "$TARGET_RG" -n "$acct" --yes -o none 2>/dev/null || true
     ok "  Deleted $acct"
 done
+
+# ──────────── 12. Source-side stale-ASR cleanup ────────────────
+# A re-triggered initial replication is slow/stuck when the previous attempt left
+# stale ASR artifacts on the SOURCE side: orphaned disk snapshots (blob + recovery),
+# a leftover mobility-agent extension, and the in-guest agent (which also raises
+# error 151083 "reboot required"). Replication is already disabled above (protected
+# items + vault deleted), so it is now safe to strip these. Implements the support
+# engineer's action plan from sync-slow-support.md.
+if [[ -n "$SOURCE_RG" ]]; then
+    info ""
+    info "== Source-side stale-ASR cleanup ($SOURCE_RG) =="
+
+    # Discover the source VMs dynamically from the RG; --vm-names only filters.
+    CLEAN_VMS=()
+    while IFS= read -r _v; do [[ -n "$_v" ]] && CLEAN_VMS+=("$_v"); done < <(
+        az vm list -g "$SOURCE_RG" --query "[].name" -o tsv 2>/dev/null)
+    if [[ -n "$VM_NAMES_CSV" ]]; then
+        IFS=',' read -ra _filter <<< "$VM_NAMES_CSV"
+        _kept=()
+        for _v in "${CLEAN_VMS[@]}"; do
+            for _f in "${_filter[@]}"; do
+                [[ "$_v" == "$(echo "$_f" | xargs)" ]] && _kept+=("$_v")
+            done
+        done
+        CLEAN_VMS=("${_kept[@]}")
+    fi
+    if [[ ${#CLEAN_VMS[@]} -eq 0 ]]; then
+        warn "  No source VMs found in $SOURCE_RG — skipping source cleanup."
+    else
+        detail "  Cleaning stale ASR state for: ${CLEAN_VMS[*]}"
+
+        # 12a. Remove the SiteRecovery mobility-service extension(s) from each VM.
+        for vm_name in "${CLEAN_VMS[@]}"; do
+            exts=$(az vm extension list -g "$SOURCE_RG" --vm-name "$vm_name" \
+                --query "[?starts_with(publisher, 'Microsoft.Azure.RecoveryServices.SiteRecovery')].name" \
+                -o tsv 2>/dev/null || true)
+            for ext in $exts; do
+                info "  Removing SiteRecovery extension $ext from $vm_name..."
+                az vm extension delete -g "$SOURCE_RG" --vm-name "$vm_name" -n "$ext" -o none 2>/dev/null \
+                    && ok "    Removed $ext" || warn "    Could not remove $ext"
+            done
+        done
+
+        # 12b. Delete the ASR cache storage account(s) — clears orphaned blob snapshots.
+        cache_accts=$(az storage account list -g "$SOURCE_RG" \
+            --query "[?starts_with(name, 'asrcache')].name" -o tsv 2>/dev/null || true)
+        for acct in $cache_accts; do
+            info "  Deleting ASR cache storage account $acct (clears blob snapshots)..."
+            az storage account delete -g "$SOURCE_RG" -n "$acct" --yes -o none 2>/dev/null \
+                && ok "    Deleted $acct" || warn "    Could not delete $acct"
+        done
+
+        # 12c. Delete orphaned ASR managed-disk snapshots of the source VM disks.
+        for vm_name in "${CLEAN_VMS[@]}"; do
+            snaps=$(az snapshot list -g "$SOURCE_RG" \
+                --query "[?creationData.sourceResourceId != null && contains(creationData.sourceResourceId, '${vm_name}')].name" \
+                -o tsv 2>/dev/null || true)
+            for snap in $snaps; do
+                info "  Deleting orphaned snapshot $snap (from $vm_name disk)..."
+                az snapshot delete -g "$SOURCE_RG" -n "$snap" -o none 2>/dev/null \
+                    && ok "    Deleted $snap" || warn "    Could not delete $snap"
+            done
+        done
+
+        # 12d. Deep clean (opt-in): the full in-guest fix from sync-slow-support.md.
+        # Per-VM: (4) remove waagent SR plugin leftovers, (5) uninstall the mobility
+        # agent, (6) run Microsoft's Cleanup-Stale-ASR-Config-Azure-VM.ps1 to strip
+        # stale fabric-side SR config, (7) reboot to clear the 151083 state.
+        if [[ "$DEEP_CLEAN" == true ]]; then
+            # Fetch Microsoft's stale-config cleanup script once (step 6).
+            STALE_CFG_URL="https://raw.githubusercontent.com/AsrOneSdk/published-scripts/master/Cleanup-Stale-ASR-Config-Azure-VM.ps1"
+            STALE_CFG_PS="$(dirname "${BASH_SOURCE[0]}")/logs/Cleanup-Stale-ASR-Config-Azure-VM.ps1"
+            have_pwsh=false; command -v pwsh &>/dev/null && have_pwsh=true
+            if [[ "$have_pwsh" == true ]]; then
+                curl -fsSL "$STALE_CFG_URL" -o "$STALE_CFG_PS" 2>/dev/null \
+                    && ok "  Downloaded Cleanup-Stale-ASR-Config-Azure-VM.ps1" \
+                    || warn "  Could not download the stale-config script — step 6 will be skipped"
+            else
+                warn "  pwsh not installed — cannot auto-run Cleanup-Stale-ASR-Config-Azure-VM.ps1 (step 6)."
+                warn "  Run it manually from Azure Cloud Shell: $STALE_CFG_URL"
+            fi
+
+            for vm_name in "${CLEAN_VMS[@]}"; do
+                # Steps 4-5: in-guest agent + plugin removal.
+                info "  Deep clean on $vm_name: removing in-guest ASR agent (run-command)..."
+                az vm run-command invoke -g "$SOURCE_RG" -n "$vm_name" \
+                    --command-id RunShellScript \
+                    --scripts "rm -rf /var/lib/waagent/Microsoft.Azure.RecoveryServices.SiteRecovery.* 2>/dev/null; if [ -x /usr/local/ASR/uninstall.sh ]; then /usr/local/ASR/uninstall.sh -Y; else echo 'no mobility agent present'; fi" \
+                    -o none 2>/dev/null \
+                    && ok "    In-guest ASR agent removed on $vm_name" \
+                    || warn "    run-command failed on $vm_name — remove the agent manually"
+
+                # Step 6: strip stale fabric-side SR config via Microsoft's script.
+                if [[ "$have_pwsh" == true && -f "$STALE_CFG_PS" ]]; then
+                    info "  Running Cleanup-Stale-ASR-Config on $vm_name..."
+                    pwsh -NonInteractive -File "$STALE_CFG_PS" \
+                        -SubscriptionId "$SUB_ID" \
+                        -VirtualMachineResourceGroupName "$SOURCE_RG" \
+                        -VirtualMachineName "$vm_name" 2>/dev/null \
+                        && ok "    Stale ASR config cleaned on $vm_name" \
+                        || warn "    Cleanup-Stale-ASR-Config failed on $vm_name — run it manually"
+                fi
+
+                # Step 7: reboot to clear the 151083 "reboot required" state.
+                info "  Rebooting $vm_name (clears the 151083 'reboot required' state)..."
+                az vm restart -g "$SOURCE_RG" -n "$vm_name" -o none 2>/dev/null \
+                    && ok "    Rebooted $vm_name" || warn "    Could not reboot $vm_name"
+            done
+            warn "Deep clean done — WAIT ~30 min before re-enabling replication (per Microsoft support guidance)."
+        else
+            detail "  (Skipped in-guest agent removal + reboot — pass --deep-clean for the definitive fix.)"
+        fi
+
+        # Note: the support step "enable public access on all VM disks" is intentionally
+        # NOT automated — it conflicts with the private-endpoint/least-privilege posture.
+        # If ASR reports disk-access errors, review each disk's network access policy manually.
+        ok "Source-side stale-ASR cleanup complete."
+    fi
+fi
 
 # ──────────── Verify ───────────────────────────────────────────
 echo ""
