@@ -545,25 +545,55 @@ if [[ "$USE_RESOURCE_MOVER" == true ]]; then
 else
     # ──── Original az CLI path (default) ────
 
-    # ──────────── 4. Target VNet + subnet ───────────────────────────
+    # ──────────── 4. Target VNet + subnets (mirror the WHOLE source net) ─
+    # Auto-detect the ENTIRE source network — every VNet address prefix and every
+    # subnet (name + prefix) — and reproduce it verbatim in the target, so each VM
+    # keeps its exact source private IP regardless of which subnet it sits in.
+    # Ranges are read from the source at migration time; nothing is entered by hand.
+    # A pre-existing target VNet with a WRONG range is the classic cause of a VM
+    # landing on a foreign IP (e.g. 10.x), so mismatches are fixed or fail loudly.
+    src_net_name=$(az network vnet list -g "$SOURCE_RG" --query "[0].name" -o tsv 2>/dev/null || true)
+    src_space=$(az network vnet show -g "$SOURCE_RG" -n "$src_net_name" \
+        --query "addressSpace.addressPrefixes" -o tsv 2>/dev/null | tr '\n\t' '  ')
+    [[ -z "$src_space" ]] && src_space="$TARGET_VNET_CIDR"
+    src_subnets=$(az network vnet show -g "$SOURCE_RG" -n "$src_net_name" \
+        --query "subnets" -o json 2>/dev/null || echo '[]')
+
     if ! az network vnet show -g "$TARGET_RG" -n "$TARGET_VNET" &>/dev/null; then
-        az network vnet create \
-            -g "$TARGET_RG" -n "$TARGET_VNET" -l "$TARGET_REGION" \
-            --address-prefix "$TARGET_VNET_CIDR" \
-            --subnet-name "$TARGET_SUBNET" --subnet-prefix "$TARGET_SUBNET_CIDR" \
-            -o none
-        ok "Created target VNet $TARGET_VNET ($TARGET_VNET_CIDR)"
+        az network vnet create -g "$TARGET_RG" -n "$TARGET_VNET" -l "$TARGET_REGION" \
+            --address-prefixes $src_space -o none
+        ok "Created target VNet $TARGET_VNET (address space: $src_space)"
     else
-        ok "Target VNet $TARGET_VNET already exists"
-        # Ensure subnet exists
-        if ! az network vnet subnet show -g "$TARGET_RG" --vnet-name "$TARGET_VNET" -n "$TARGET_SUBNET" &>/dev/null; then
-            az network vnet subnet create \
-                -g "$TARGET_RG" --vnet-name "$TARGET_VNET" \
-                -n "$TARGET_SUBNET" --address-prefix "$TARGET_SUBNET_CIDR" \
-                -o none
-            ok "Created subnet $TARGET_SUBNET in existing VNet"
-        fi
+        existing_space=$(az network vnet show -g "$TARGET_RG" -n "$TARGET_VNET" \
+            --query "addressSpace.addressPrefixes" -o tsv 2>/dev/null | tr '\n\t' '  ')
+        for p in $src_space; do
+            if [[ " $existing_space " != *" $p "* ]]; then
+                info "  Adding source address prefix $p to existing VNet $TARGET_VNET"
+                az network vnet update -g "$TARGET_RG" -n "$TARGET_VNET" \
+                    --address-prefixes $existing_space $src_space -o none 2>/dev/null \
+                    || err "Target VNet $TARGET_VNET space [$existing_space] cannot absorb source prefix $p. Reset the target (00-reset-target.sh) to recreate it with the source range."
+                break
+            fi
+        done
+        ok "Target VNet $TARGET_VNET address space includes the source ranges"
     fi
+
+    # Reproduce every source subnet with its exact name + prefix.
+    while IFS=$'\t' read -r sname sprefix; do
+        [[ -z "$sname" || -z "$sprefix" ]] && continue
+        existing_prefix=$(az network vnet subnet show -g "$TARGET_RG" --vnet-name "$TARGET_VNET" \
+            -n "$sname" --query "addressPrefix" -o tsv 2>/dev/null || true)
+        if [[ -z "$existing_prefix" ]]; then
+            az network vnet subnet create -g "$TARGET_RG" --vnet-name "$TARGET_VNET" \
+                -n "$sname" --address-prefix "$sprefix" -o none \
+                && ok "  Reproduced source subnet $sname ($sprefix)" \
+                || warn "  Could not create subnet $sname ($sprefix)"
+        elif [[ "$existing_prefix" != "$sprefix" ]]; then
+            err "Target subnet $sname has prefix $existing_prefix but source is $sprefix — VMs there would NOT keep their private IPs. Reset the target (00-reset-target.sh) to recreate it with the source prefix."
+        else
+            detail "  Subnet $sname already matches source ($sprefix)"
+        fi
+    done < <(echo "$src_subnets" | jq -r '.[] | [.name, (.addressPrefix // .addressPrefixes[0])] | @tsv')
 
     # ──────────── 5. Target NSGs (ASR does NOT replicate NSGs) ──────
     info "Replicating source NSGs to target..."

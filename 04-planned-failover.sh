@@ -295,6 +295,7 @@ ok "All VMs failed over to $TARGET_REGION"
 
 # ──────────── 4. Post-failover network wiring ─────────────────
 VM_PIP_SUMMARY=()
+IP_MISMATCHES=""
 if [[ "$SKIP_WIRING" == false ]]; then
     info "Running post-failover network wiring..."
 
@@ -533,10 +534,27 @@ if [[ "$SKIP_WIRING" == false ]]; then
             fi
         done
 
-        # 4d. Boot Integrity Monitoring reminder per VM
+        # 4d. Assert the failed-over VM kept its EXACT source private IP.
+        # (Guards against the "landed on a foreign IP like 10.x" failure — the pin
+        # in script 02 must have taken and the target subnet must contain the IP.)
+        src_ip=$(jq -r --arg vm "$vm_name" \
+            '.[] | select(.vm == $vm) | .nics[0].ipConfigurations[0].privateIp // empty' \
+            "$INVENTORY_FILE" 2>/dev/null | head -n1 || true)
+        tgt_ip=$(echo "$nic_json" | jq -r '.ipConfigurations[0] | (.privateIPAddress // .privateIpAddress) // empty')
+        if [[ -n "$src_ip" ]]; then
+            if [[ "$src_ip" == "$tgt_ip" ]]; then
+                ok "    Private IP preserved: $vm_name = $tgt_ip (matches source)"
+            else
+                warn "  PRIVATE IP MISMATCH on $vm_name: source=$src_ip target=${tgt_ip:-none}. IP-pinned apps (e.g. OpenSearch) will break — the target subnet range likely does not match the source; re-stage (01) + re-pin (02)."
+                IP_MISMATCHES="${IP_MISMATCHES} ${vm_name}"
+            fi
+        fi
+
+        # 4e. Boot Integrity Monitoring reminder per VM
         detail "  ACTION REQUIRED: Re-enable Boot Integrity Monitoring on $vm_name"
     done
 
+    [[ -n "${IP_MISMATCHES// }" ]] && warn "Private IP was NOT preserved for:${IP_MISMATCHES} — see the mismatch warnings above."
     ok "Post-failover network wiring complete"
 else
     info "  Skipping network wiring (--skip-wiring)"

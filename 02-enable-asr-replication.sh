@@ -727,18 +727,21 @@ if [[ "$NO_WAIT" == false ]]; then
 
             state=$(echo "$item_json" | jq -r '.properties.protectionState // "Unknown"')
             health=$(echo "$item_json" | jq -r '.properties.replicationHealth // "Unknown"')
+            # Sync progress % (same field the ASR portal shows); may be null early on.
+            pct=$(echo "$item_json" | jq -r '.properties.providerSpecificDetails.monitoringPercentageCompletion // empty')
+            pct_str=""; [[ -n "$pct" ]] && pct_str=" sync: ${pct}%"
 
             case "$state" in
                 Protected)
-                    ok "  $vm_name: Protected (health: $health)" ;;
+                    ok "  $vm_name: Protected (health: $health)${pct_str}" ;;
                 *Failed*)
                     # Terminal failure — don't loop forever. Surface the health error.
                     hint=$(echo "$item_json" | jq -r '[.properties.healthErrors[]? | .errorMessage] | join("; ") // empty')
-                    warn "  $vm_name: $state (health: $health) — enable FAILED: ${hint:-see portal}"
+                    warn "  $vm_name: $state (health: $health)${pct_str} — enable FAILED: ${hint:-see portal}"
                     failed_vms="${failed_vms} ${vm_name}"
                     all_synced=false ;;
                 *)
-                    detail "  $vm_name: $state (health: $health) — syncing..."
+                    detail "  $vm_name: $state (health: $health)${pct_str} — syncing..."
                     all_synced=false ;;
             esac
         done
@@ -781,6 +784,7 @@ fi
 # stored on the item as staticIPAddress). tfo* fields do the same for test failover.
 # Requires the target subnet to contain that IP — script 01 mirrors the source range.
 info "Pinning recovery private IPs to match source (static assignment)..."
+PIN_FAILURES=""
 for vm_name in "${VM_NAMES[@]}"; do
     vm_name="$(echo "$vm_name" | xargs)"
     ITEM_NAME="asr-${vm_name}"
@@ -822,13 +826,27 @@ for vm_name in "${VM_NAMES[@]}"; do
     patch_body=$(jq -n --argjson nics "$nic_update" \
         '{properties: {providerSpecificDetails: {instanceType: "A2A"}, vmNics: $nics}}')
 
-    if az rest --method patch --uri "$item_uri" --body "$patch_body" -o none 2>/dev/null; then
-        pinned=$(echo "$nic_update" | jq -r '[.[].ipConfigs[].recoveryStaticIPAddress] | join(", ")')
-        ok "  $vm_name: recovery private IP pinned to source ($pinned)"
+    az rest --method patch --uri "$item_uri" --body "$patch_body" -o none 2>/dev/null \
+        || warn "  $vm_name: pin PATCH call failed — verifying result below"
+
+    # Read back what actually stuck. ASR silently ignores a recovery static IP that
+    # is outside the target subnet range, leaving it Dynamic — which is exactly how a
+    # VM ends up on a foreign IP (e.g. 10.x) after failover. Fail loud if so.
+    want=$(echo "$nic_update" | jq -r '[.[].ipConfigs[].recoveryStaticIPAddress] | join(",")')
+    got=$(az rest --method get --uri "$item_uri" -o json 2>/dev/null \
+        | jq -r '[.properties.providerSpecificDetails.vmNics[]?.ipConfigs[]? | (.recoveryStaticIPAddress // "") | select(. != "")] | join(",")')
+    if [[ -n "$got" && "$got" == "$want" ]]; then
+        ok "  $vm_name: recovery private IP pinned to source ($got)"
     else
-        warn "  $vm_name: could not pin recovery private IP — set it in the portal before failover"
+        warn "  $vm_name: recovery IP did NOT pin (wanted [$want], got [${got:-none/Dynamic]}])."
+        warn "    Cause is almost always the target subnet not containing that IP — confirm the"
+        warn "    target VNet/subnet mirrors the source range (script 01), then re-run this script."
+        PIN_FAILURES="${PIN_FAILURES} ${vm_name}"
     fi
 done
+if [[ -n "${PIN_FAILURES// }" ]]; then
+    err "Recovery private IP could not be pinned for:${PIN_FAILURES}. These VMs would fail over to a FOREIGN private IP. Fix the target range and re-run before failover."
+fi
 
 # ──────────── Done ──────────────────────────────────────────────
 echo ""
