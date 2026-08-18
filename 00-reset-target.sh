@@ -422,8 +422,20 @@ if [[ -n "$SOURCE_RG" ]]; then
         done
 
         # 12b. Delete the ASR cache storage account(s) — clears orphaned blob snapshots.
+        # CRITICAL: delete the cache SA's private endpoint(s) FIRST. Deleting the SA
+        # while leaving the PE behind orphans it (Disconnected); script 02 then skips
+        # PE creation (it exists) and the recreated SA has no network path — ASR fails
+        # enable with error 150190. Removing the PE lets 02 recreate a clean one.
         cache_accts=$(az storage account list -g "$SOURCE_RG" \
             --query "[?starts_with(name, 'asrcache')].name" -o tsv 2>/dev/null || true)
+        if [[ -n "$cache_accts" ]]; then
+            for pe in $(az network private-endpoint list -g "$SOURCE_RG" \
+                --query "[?starts_with(name, 'pe-asrcache')].name" -o tsv 2>/dev/null || true); do
+                info "  Deleting orphaned cache private endpoint $pe..."
+                az network private-endpoint delete -g "$SOURCE_RG" -n "$pe" -o none 2>/dev/null \
+                    && ok "    Deleted $pe" || warn "    Could not delete $pe"
+            done
+        fi
         for acct in $cache_accts; do
             info "  Deleting ASR cache storage account $acct (clears blob snapshots)..."
             az storage account delete -g "$SOURCE_RG" -n "$acct" --yes -o none 2>/dev/null \
@@ -450,13 +462,20 @@ if [[ -n "$SOURCE_RG" ]]; then
             # Fetch Microsoft's stale-config cleanup script once (step 6).
             STALE_CFG_URL="https://raw.githubusercontent.com/AsrOneSdk/published-scripts/master/Cleanup-Stale-ASR-Config-Azure-VM.ps1"
             STALE_CFG_PS="$(dirname "${BASH_SOURCE[0]}")/logs/Cleanup-Stale-ASR-Config-Azure-VM.ps1"
-            have_pwsh=false; command -v pwsh &>/dev/null && have_pwsh=true
-            if [[ "$have_pwsh" == true ]]; then
-                curl -fsSL "$STALE_CFG_URL" -o "$STALE_CFG_PS" 2>/dev/null \
-                    && ok "  Downloaded Cleanup-Stale-ASR-Config-Azure-VM.ps1" \
-                    || warn "  Could not download the stale-config script — step 6 will be skipped"
+            # Step 6 needs pwsh AND the Az PowerShell module (the script calls Az cmdlets).
+            # Without Az it just errors, so gate on both and skip cleanly otherwise.
+            have_stalecfg=false
+            if command -v pwsh &>/dev/null; then
+                if pwsh -NonInteractive -Command "if (Get-Module -ListAvailable Az.Accounts) { exit 0 } else { exit 1 }" &>/dev/null; then
+                    curl -fsSL "$STALE_CFG_URL" -o "$STALE_CFG_PS" 2>/dev/null \
+                        && { have_stalecfg=true; ok "  Downloaded Cleanup-Stale-ASR-Config-Azure-VM.ps1"; } \
+                        || warn "  Could not download the stale-config script — step 6 skipped"
+                else
+                    warn "  pwsh present but Az module not installed — skipping Cleanup-Stale-ASR-Config (step 6)."
+                    warn "  Run it manually from Azure Cloud Shell (has Az): $STALE_CFG_URL"
+                fi
             else
-                warn "  pwsh not installed — cannot auto-run Cleanup-Stale-ASR-Config-Azure-VM.ps1 (step 6)."
+                warn "  pwsh not installed — skipping Cleanup-Stale-ASR-Config (step 6)."
                 warn "  Run it manually from Azure Cloud Shell: $STALE_CFG_URL"
             fi
 
@@ -471,7 +490,7 @@ if [[ -n "$SOURCE_RG" ]]; then
                     || warn "    run-command failed on $vm_name — remove the agent manually"
 
                 # Step 6: strip stale fabric-side SR config via Microsoft's script.
-                if [[ "$have_pwsh" == true && -f "$STALE_CFG_PS" ]]; then
+                if [[ "$have_stalecfg" == true ]]; then
                     info "  Running Cleanup-Stale-ASR-Config on $vm_name..."
                     pwsh -NonInteractive -File "$STALE_CFG_PS" \
                         -SubscriptionId "$SUB_ID" \
@@ -481,12 +500,13 @@ if [[ -n "$SOURCE_RG" ]]; then
                         || warn "    Cleanup-Stale-ASR-Config failed on $vm_name — run it manually"
                 fi
 
-                # Step 7: reboot to clear the 151083 "reboot required" state.
-                info "  Rebooting $vm_name (clears the 151083 'reboot required' state)..."
-                az vm restart -g "$SOURCE_RG" -n "$vm_name" -o none 2>/dev/null \
-                    && ok "    Rebooted $vm_name" || warn "    Could not reboot $vm_name"
+                # Step 7: reboot to clear the 151083 state. --no-wait so a slow ARM
+                # restart can't hang the whole cleanup (issue-and-continue).
+                info "  Rebooting $vm_name (--no-wait; clears the 151083 'reboot required' state)..."
+                az vm restart -g "$SOURCE_RG" -n "$vm_name" --no-wait -o none 2>/dev/null \
+                    && ok "    Reboot issued for $vm_name" || warn "    Could not issue reboot for $vm_name"
             done
-            warn "Deep clean done — WAIT ~30 min before re-enabling replication (per Microsoft support guidance)."
+            warn "Deep clean done — reboots were issued async; WAIT ~30 min before re-enabling replication (per Microsoft support guidance)."
         else
             detail "  (Skipped in-guest agent removal + reboot — pass --deep-clean for the definitive fix.)"
         fi

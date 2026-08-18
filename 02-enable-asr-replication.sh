@@ -439,7 +439,20 @@ TARGET_VNET_ID=$(az network vnet show -g "$TARGET_RG" -n "$TARGET_VNET" --query 
 #    over private link (the account firewall denies all other public access) ──
 PE_NAME="pe-${CACHE_STORAGE_ACCT}-blob"
 BLOB_DNS_ZONE="privatelink.blob.core.windows.net"
-if ! az network private-endpoint show -g "$SOURCE_RG" -n "$PE_NAME" &>/dev/null; then
+# A pre-existing PE may be stale (Disconnected) — e.g. its cache SA was deleted and
+# recreated. A Disconnected PE gives no data path, so ASR enable fails with 150190.
+# Detect that and delete it (plus any other stale cache PEs) so we recreate a live one.
+pe_state=$(az network private-endpoint show -g "$SOURCE_RG" -n "$PE_NAME" \
+    --query "privateLinkServiceConnections[0].privateLinkServiceConnectionState.status" -o tsv 2>/dev/null || true)
+if [[ -n "$pe_state" && "$pe_state" != "Approved" ]]; then
+    warn "Private endpoint $PE_NAME is '$pe_state' (stale) — recreating..."
+    for stale_pe in $(az network private-endpoint list -g "$SOURCE_RG" \
+        --query "[?starts_with(name,'pe-asrcache')].name" -o tsv 2>/dev/null || true); do
+        az network private-endpoint delete -g "$SOURCE_RG" -n "$stale_pe" -o none 2>/dev/null || true
+    done
+    pe_state=""
+fi
+if [[ -z "$pe_state" ]]; then
     info "Creating private endpoint $PE_NAME for cache storage in $SOURCE_VNET_NAME/$SOURCE_SUBNET_NAME..."
     az network private-dns zone create -g "$SOURCE_RG" -n "$BLOB_DNS_ZONE" -o none 2>/dev/null || true
     az network private-dns link vnet create -g "$SOURCE_RG" --zone-name "$BLOB_DNS_ZONE" \
@@ -803,7 +816,9 @@ for vm_name in "${VM_NAMES[@]}"; do
         continue
     fi
 
-    # Build the NIC update, copying each ipConfig's source IP into the recovery/tfo static fields.
+    # Pin the PLANNED-failover IP only. Azure does NOT persist tfoStaticIPAddress via
+    # this update (verified across api-versions), so the test-failover IP cannot be
+    # pre-pinned here — script 03 sets the exact IP on the test NIC after boot instead.
     nic_update=$(echo "$vm_nics" | jq '[.[] | {
         nicId: .nicId,
         ipConfigs: [ .ipConfigs[]
@@ -812,9 +827,7 @@ for vm_name in "${VM_NAMES[@]}"; do
                 ipConfigName: .name,
                 isPrimary: (.isPrimary // true),
                 recoverySubnetName: .recoverySubnetName,
-                recoveryStaticIPAddress: .staticIPAddress,
-                tfoSubnetName: .recoverySubnetName,
-                tfoStaticIPAddress: .staticIPAddress
+                recoveryStaticIPAddress: .staticIPAddress
               } ]
     } | select((.ipConfigs | length) > 0)]')
 
@@ -829,18 +842,22 @@ for vm_name in "${VM_NAMES[@]}"; do
     az rest --method patch --uri "$item_uri" --body "$patch_body" -o none 2>/dev/null \
         || warn "  $vm_name: pin PATCH call failed — verifying result below"
 
-    # Read back what actually stuck. ASR silently ignores a recovery static IP that
-    # is outside the target subnet range, leaving it Dynamic — which is exactly how a
-    # VM ends up on a foreign IP (e.g. 10.x) after failover. Fail loud if so.
+    # Read back what actually stuck — for BOTH planned (recovery) and test (tfo).
+    # ASR silently ignores a static IP outside the target subnet, leaving it Dynamic,
+    # which is exactly how a VM ends up on a foreign IP (10.x) or a shifted IP (.6
+    # instead of .4) after failover. Verify each and fail loud if either didn't take.
     want=$(echo "$nic_update" | jq -r '[.[].ipConfigs[].recoveryStaticIPAddress] | join(",")')
-    got=$(az rest --method get --uri "$item_uri" -o json 2>/dev/null \
-        | jq -r '[.properties.providerSpecificDetails.vmNics[]?.ipConfigs[]? | (.recoveryStaticIPAddress // "") | select(. != "")] | join(",")')
-    if [[ -n "$got" && "$got" == "$want" ]]; then
-        ok "  $vm_name: recovery private IP pinned to source ($got)"
+    read_back() {
+        az rest --method get --uri "$item_uri" -o json 2>/dev/null \
+            | jq -r --arg f "$1" '[.properties.providerSpecificDetails.vmNics[]?.ipConfigs[]? | (.[$f] // "") | select(. != "")] | join(",")'
+    }
+    got_recovery=$(read_back recoveryStaticIPAddress)
+    if [[ "$got_recovery" == "$want" ]]; then
+        ok "  $vm_name: planned-failover IP pinned to source ($want). (Test-failover IP is set post-boot by script 03.)"
     else
-        warn "  $vm_name: recovery IP did NOT pin (wanted [$want], got [${got:-none/Dynamic]}])."
-        warn "    Cause is almost always the target subnet not containing that IP — confirm the"
-        warn "    target VNet/subnet mirrors the source range (script 01), then re-run this script."
+        warn "  $vm_name: planned-failover IP did NOT pin (wanted [$want], got [${got_recovery:-none}])."
+        warn "    Usually the target subnet does not contain that IP — confirm 01 mirrored the"
+        warn "    source range, and that the IP is FREE in the target subnet, then re-run."
         PIN_FAILURES="${PIN_FAILURES} ${vm_name}"
     fi
 done
