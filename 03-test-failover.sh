@@ -290,12 +290,37 @@ for i in "${!VM_NAMES[@]}"; do
     ipconfig_name=$(az network nic show -g "$TARGET_RG" -n "$TEST_NIC_NAME" \
         --query "ipConfigurations[0].name" -o tsv)
 
-    # Attach PIP to test NIC
-    az network nic ip-config update \
-        -g "$TARGET_RG" --nic-name "$TEST_NIC_NAME" \
-        -n "$ipconfig_name" \
-        --public-ip-address "$TEST_PIP_NAME" \
-        -o none
+    # Pin the test VM to its EXACT source private IP. Azure does not persist a
+    # pre-set test-failover static IP (tfoStaticIPAddress is ignored), so ASR gives
+    # the test VM a DYNAMIC address (e.g. .6 instead of .4). We fix that here by
+    # setting the test NIC to Static = the source IP, then rebooting so the guest
+    # picks it up. The IP is free during a test (the real VM doesn't exist yet).
+    src_priv_ip=""
+    if [[ -n "$SOURCE_RG" ]]; then
+        src_priv_ip=$(az vm show -g "$SOURCE_RG" -n "$vm_name" -d \
+            --query "privateIps" -o tsv 2>/dev/null | awk -F, '{print $1}' | xargs || true)
+    fi
+    if [[ -n "$src_priv_ip" ]]; then
+        if az network nic ip-config update -g "$TARGET_RG" --nic-name "$TEST_NIC_NAME" \
+            -n "$ipconfig_name" --private-ip-address "$src_priv_ip" \
+            --public-ip-address "$TEST_PIP_NAME" -o none 2>/dev/null; then
+            got_ip=$(az network nic show -g "$TARGET_RG" -n "$TEST_NIC_NAME" \
+                --query "ipConfigurations[0].privateIPAddress" -o tsv 2>/dev/null)
+            if [[ "$got_ip" == "$src_priv_ip" ]]; then
+                ok "  $vm_name: test NIC pinned to source private IP $src_priv_ip"
+                info "    Rebooting $TEST_NIC_NAME's VM so the guest picks up $src_priv_ip..."
+                az vm restart -g "$TARGET_RG" -n "${vm_name}-test" --no-wait -o none 2>/dev/null || true
+            else
+                warn "  $vm_name: could not pin test IP to $src_priv_ip (got ${got_ip:-none}) — is it free in the subnet?"
+            fi
+        else
+            warn "  $vm_name: setting test NIC to $src_priv_ip failed (IP taken, or outside subnet) — left dynamic"
+        fi
+    else
+        # No source IP available — just attach the PIP with the dynamic IP.
+        az network nic ip-config update -g "$TARGET_RG" --nic-name "$TEST_NIC_NAME" \
+            -n "$ipconfig_name" --public-ip-address "$TEST_PIP_NAME" -o none
+    fi
     ok "  $vm_name: PIP $TEST_PIP_NAME attached to $TEST_NIC_NAME"
 
     # Apply the source DNS label to the test PIP
