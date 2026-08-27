@@ -49,3 +49,6 @@ terraform.rc
 # Migration inventory (contains subscription/resource IDs)
 source-inventory.json
 logs/
+terraform/**/.terraform/
+terraform/**/.import-archive/
+terraform/**/*.tfstate*

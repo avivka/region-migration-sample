@@ -234,6 +234,76 @@ echo ""
 read -rp "Type 'FAILOVER' to proceed (or Ctrl+C to abort): " confirm
 [[ "$confirm" != "FAILOVER" ]] && err "Aborted — you must type FAILOVER to proceed."
 
+# ──────────── 2b. Point recovery config at the RIGHT network + IP ─────────────
+# The failed-over VM lands in whatever recovery network the protected item holds,
+# and a NIC can never move VNets after creation — so this MUST be correct before
+# triggering. Per VM: derive its SOURCE VNet/subnet/IP from its NIC, require the
+# same-named VNet in the target RG whose subnet can hold that IP, and PATCH the
+# item (metadata only — does NOT touch the completed sync) so failover lands in
+# the right subnet with the exact source private IP.
+info "Verifying/repointing recovery network + private IP per VM (pre-failover gate)..."
+for vm_name in "${VM_NAMES[@]}"; do
+    vm_name="$(echo "$vm_name" | xargs)"
+    ITEM_NAME="asr-${vm_name}"
+    item_uri="https://management.azure.com/subscriptions/${SUB_ID}/resourceGroups/${TARGET_RG}/providers/Microsoft.RecoveryServices/vaults/${VAULT_NAME}/replicationFabrics/${SRC_FABRIC}/replicationProtectionContainers/${SRC_CONTAINER}/replicationProtectedItems/${ITEM_NAME}?api-version=${API_VERSION}"
+
+    # Source network identity of THIS VM (per-NIC — never "first vnet in the RG")
+    src_nic_id=$(az vm show -g "$SOURCE_RG" -n "$vm_name" --query "networkProfile.networkInterfaces[0].id" -o tsv 2>/dev/null)
+    src_subnet_id=$(az network nic show --ids "$src_nic_id" --query "ipConfigurations[0].subnet.id" -o tsv 2>/dev/null)
+    src_ip=$(az network nic show --ids "$src_nic_id" -o json 2>/dev/null \
+        | jq -r '.ipConfigurations[0] | (.privateIPAddress // .privateIpAddress)')
+    src_vnet_name=$(awk -F'/virtualNetworks/' '{print $2}' <<<"$src_subnet_id" | awk -F'/' '{print $1}')
+    src_subnet_name=$(awk -F'/subnets/' '{print $2}' <<<"$src_subnet_id")
+    [[ -z "$src_ip" || -z "$src_vnet_name" ]] && err "$vm_name: could not read source NIC/IP — aborting before failover."
+
+    # Same-named VNet must exist in the target RG and be able to hold the IP.
+    tgt_vnet_id=$(az network vnet show -g "$TARGET_RG" -n "$src_vnet_name" --query id -o tsv 2>/dev/null || true)
+    [[ -z "$tgt_vnet_id" ]] && err "$vm_name: target VNet '$src_vnet_name' not found in $TARGET_RG. The failover would land in a WRONG network. Stage the mirrored VNet (script 01) and re-run."
+    ipcheck=$(az network vnet check-ip-address -g "$TARGET_RG" -n "$src_vnet_name" \
+        --ip-address "$src_ip" --query available -o tsv 2>/dev/null || echo "out-of-range")
+    if [[ "$ipcheck" == "out-of-range" ]]; then
+        err "$vm_name: target VNet '$src_vnet_name' cannot hold $src_ip — its range does not mirror the source. Fix the VNet range (script 01) and re-run."
+    elif [[ "$ipcheck" != "true" ]]; then
+        err "$vm_name: $src_ip is already TAKEN in target VNet '$src_vnet_name' (leftover test VM/NIC?). Clean up the holder (03 cleanup) and re-run."
+    fi
+
+    # Repoint the item if its recovery network/subnet/IP is wrong.
+    item_json=$(az rest --method get --uri "$item_uri" -o json 2>/dev/null || echo '{}')
+    cur_net=$(echo "$item_json" | jq -r '.properties.providerSpecificDetails.recoveryAzureNetworkId // ""')
+    cur_ip=$(echo "$item_json" | jq -r '.properties.providerSpecificDetails.vmNics[0].ipConfigs[0].recoveryStaticIPAddress // ""')
+    nic_patch=$(echo "$item_json" | jq --arg sn "$src_subnet_name" --arg ip "$src_ip" \
+        '[.properties.providerSpecificDetails.vmNics[]? | {
+            nicId: .nicId,
+            ipConfigs: [ .ipConfigs[] | {
+                ipConfigName: .name, isPrimary: (.isPrimary // true),
+                recoverySubnetName: $sn, recoveryStaticIPAddress: $ip,
+                tfoSubnetName: $sn, tfoStaticIPAddress: $ip } ] }]')
+    if [[ "$(echo "$nic_patch" | jq 'length')" == "0" ]]; then
+        err "$vm_name: protected item has no NIC config — cannot verify recovery network. Check the item in the portal."
+    fi
+    if [[ "$(tr '[:upper:]' '[:lower:]' <<<"$cur_net")" != "$(tr '[:upper:]' '[:lower:]' <<<"$tgt_vnet_id")" || "$cur_ip" != "$src_ip" ]]; then
+        detail "  $vm_name: repointing recovery to $src_vnet_name/$src_subnet_name @ $src_ip (was net=${cur_net##*/} ip=${cur_ip:-dynamic})"
+        patch_body=$(jq -n --argjson nics "$nic_patch" --arg net "$tgt_vnet_id" \
+            '{properties: {selectedRecoveryAzureNetworkId: $net, selectedTfoAzureNetworkId: $net,
+                           providerSpecificDetails: {instanceType: "A2A"}, vmNics: $nics}}')
+        az rest --method patch --uri "$item_uri" --body "$patch_body" -o none 2>/dev/null || true
+        fixed_net=""
+        for _ in $(seq 1 8); do
+            sleep 10
+            fixed_net=$(az rest --method get --uri "$item_uri" -o json 2>/dev/null \
+                | jq -r '.properties.providerSpecificDetails.recoveryAzureNetworkId // ""')
+            [[ "$(tr '[:upper:]' '[:lower:]' <<<"$fixed_net")" == "$(tr '[:upper:]' '[:lower:]' <<<"$tgt_vnet_id")" ]] && break
+        done
+        if [[ "$(tr '[:upper:]' '[:lower:]' <<<"$fixed_net")" != "$(tr '[:upper:]' '[:lower:]' <<<"$tgt_vnet_id")" ]]; then
+            err "$vm_name: could NOT repoint the recovery network to $src_vnet_name — failover would land in the wrong VNet. Aborting BEFORE failover. Check the item's Compute+Network settings in the portal."
+        fi
+        ok "  $vm_name: recovery -> $src_vnet_name/$src_subnet_name @ $src_ip"
+    else
+        ok "  $vm_name: recovery already correct ($src_vnet_name @ ${cur_ip:-dynamic->$src_ip})"
+    fi
+done
+ok "Pre-failover network gate passed for all VMs."
+
 # ──────────── 3. Trigger failover per VM ──────────────────────
 # A2A does NOT support "plannedFailover" — use "unplannedFailover" instead.
 # When VMs are Protected and fully synced, unplannedFailover with the latest
@@ -295,7 +365,6 @@ ok "All VMs failed over to $TARGET_REGION"
 
 # ──────────── 4. Post-failover network wiring ─────────────────
 VM_PIP_SUMMARY=()
-IP_MISMATCHES=""
 if [[ "$SKIP_WIRING" == false ]]; then
     info "Running post-failover network wiring..."
 
@@ -534,27 +603,95 @@ if [[ "$SKIP_WIRING" == false ]]; then
             fi
         done
 
-        # 4d. Assert the failed-over VM kept its EXACT source private IP.
-        # (Guards against the "landed on a foreign IP like 10.x" failure — the pin
-        # in script 02 must have taken and the target subnet must contain the IP.)
-        src_ip=$(jq -r --arg vm "$vm_name" \
-            '.[] | select(.vm == $vm) | .nics[0].ipConfigurations[0].privateIp // empty' \
-            "$INVENTORY_FILE" 2>/dev/null | head -n1 || true)
-        tgt_ip=$(echo "$nic_json" | jq -r '.ipConfigurations[0] | (.privateIPAddress // .privateIpAddress) // empty')
-        if [[ -n "$src_ip" ]]; then
-            if [[ "$src_ip" == "$tgt_ip" ]]; then
-                ok "    Private IP preserved: $vm_name = $tgt_ip (matches source)"
-            else
-                warn "  PRIVATE IP MISMATCH on $vm_name: source=$src_ip target=${tgt_ip:-none}. IP-pinned apps (e.g. OpenSearch) will break — the target subnet range likely does not match the source; re-stage (01) + re-pin (02)."
-                IP_MISMATCHES="${IP_MISMATCHES} ${vm_name}"
-            fi
-        fi
-
-        # 4e. Boot Integrity Monitoring reminder per VM
+        # 4d. Boot Integrity Monitoring reminder per VM
         detail "  ACTION REQUIRED: Re-enable Boot Integrity Monitoring on $vm_name"
     done
 
-    [[ -n "${IP_MISMATCHES// }" ]] && warn "Private IP was NOT preserved for:${IP_MISMATCHES} — see the mismatch warnings above."
+    # ──────────── 4e. Enforce EXACT source private IP (authoritative) ──────────
+    # Multiple failed-over VMs get dynamic IPs that can OCCUPY EACH OTHER'S wanted
+    # source IPs (VM-001 wants .4 but VM-002 dynamically took it). Two passes:
+    # pass 1 parks every wrong-IP NIC on a free temp IP (releases the contested
+    # ones), pass 2 claims the exact source IP; then reboot so the guests bind it.
+    info "Enforcing exact source private IPs on failed-over VMs (two-pass)..."
+    E_VMS=(); E_NICS=(); E_IPCS=(); E_WANT=(); ip_reboot=""
+    for vm_name in "${VM_NAMES[@]}"; do
+        vm_name="$(echo "$vm_name" | xargs)"
+        src_ip=$(jq -r --arg vm "$vm_name" \
+            '.[] | select(.vm==$vm) | .nics[0].ipConfigurations[0].privateIp // empty' \
+            "$INVENTORY_FILE" 2>/dev/null | head -n1)
+        [[ -z "$src_ip" ]] && src_ip=$(az vm show -g "$SOURCE_RG" -n "$vm_name" -d \
+            --query "privateIps" -o tsv 2>/dev/null | awk -F, '{print $1}' | xargs)
+        [[ -z "$src_ip" ]] && { warn "  $vm_name: could not determine source private IP — skipping"; continue; }
+        tnic=$(az vm show -g "$TARGET_RG" -n "$vm_name" \
+            --query "networkProfile.networkInterfaces[0].id" -o tsv 2>/dev/null)
+        [[ -z "$tnic" ]] && { warn "  $vm_name: target NIC not found — skipping"; continue; }
+        cur=$(az network nic show --ids "$tnic" --query "ipConfigurations[0].privateIPAddress" -o tsv 2>/dev/null)
+        if [[ "$cur" == "$src_ip" ]]; then
+            ok "  $vm_name: private IP already = source ($src_ip)"
+            continue
+        fi
+        E_VMS+=("$vm_name"); E_NICS+=("$tnic"); E_WANT+=("$src_ip")
+        E_IPCS+=("$(az network nic show --ids "$tnic" --query "ipConfigurations[0].name" -o tsv 2>/dev/null)")
+    done
+
+    if [[ ${#E_VMS[@]} -gt 0 ]]; then
+        # Resolve the target VNet (all NICs share it) for temp-IP availability checks.
+        e_vnet=$(az network nic show --ids "${E_NICS[0]}" --query "ipConfigurations[0].subnet.id" -o tsv \
+            | awk -F'/virtualNetworks/' '{print $2}' | awk -F'/' '{print $1}')
+        # Pass 1: park every wrong-IP NIC on a free temp IP (frees contested IPs).
+        for i in "${!E_VMS[@]}"; do
+            base=$(cut -d. -f1-3 <<<"${E_WANT[$i]}")
+            parked=""
+            for oct in $(seq 200 250); do
+                cand="${base}.${oct}"
+                avail=$(az network vnet check-ip-address -g "$TARGET_RG" -n "$e_vnet" \
+                    --ip-address "$cand" --query available -o tsv 2>/dev/null || echo false)
+                [[ "$avail" == "true" ]] || continue
+                if az network nic ip-config update --ids "${E_NICS[$i]}" -n "${E_IPCS[$i]}" \
+                    --private-ip-address "$cand" -o none 2>/dev/null; then
+                    parked="$cand"; break
+                fi
+            done
+            [[ -n "$parked" ]] && detail "  ${E_VMS[$i]}: parked on $parked (freeing contested IPs)" \
+                || warn "  ${E_VMS[$i]}: could not park — will try direct assignment"
+        done
+        # Pass 2: claim the exact source IP.
+        for i in "${!E_VMS[@]}"; do
+            if az network nic ip-config update --ids "${E_NICS[$i]}" -n "${E_IPCS[$i]}" \
+                --private-ip-address "${E_WANT[$i]}" -o none 2>/dev/null; then
+                ok "  ${E_VMS[$i]}: private IP set to source ${E_WANT[$i]}"
+                ip_reboot="$ip_reboot ${E_VMS[$i]}"
+            else
+                warn "  ${E_VMS[$i]}: FAILED to set ${E_WANT[$i]} — either the subnet does not span it"
+                warn "    or another NIC outside this VM set holds it. Free the IP and re-run."
+                IP_ENFORCE_FAILED=yes
+            fi
+        done
+    fi
+    # Reboot the VMs whose IP changed so the guest OS binds the new address.
+    for vm_name in $ip_reboot; do
+        az vm restart -g "$TARGET_RG" -n "$vm_name" --no-wait -o none 2>/dev/null \
+            && detail "  $vm_name: reboot issued so the guest picks up its source IP" || true
+    done
+    # Final proof: source private IP == destination private IP for every VM.
+    info "Verifying source private IP == destination private IP..."
+    for vm_name in "${VM_NAMES[@]}"; do
+        vm_name="$(echo "$vm_name" | xargs)"
+        s=$(jq -r --arg vm "$vm_name" \
+            '.[] | select(.vm==$vm) | .nics[0].ipConfigurations[0].privateIp // empty' \
+            "$INVENTORY_FILE" 2>/dev/null | head -n1)
+        [[ -z "$s" ]] && s=$(az vm show -g "$SOURCE_RG" -n "$vm_name" -d --query "privateIps" -o tsv 2>/dev/null | awk -F, '{print $1}' | xargs)
+        d=$(az vm show -g "$TARGET_RG" -n "$vm_name" -d --query "privateIps" -o tsv 2>/dev/null | awk -F, '{print $1}' | xargs)
+        if [[ -n "$s" && "$s" == "$d" ]]; then
+            ok "  $vm_name: source=$s  destination=$d  MATCH"
+        else
+            warn "  $vm_name: source=$s  destination=$d  MISMATCH"
+            IP_ENFORCE_FAILED=yes
+        fi
+    done
+    [[ "${IP_ENFORCE_FAILED:-}" == "yes" ]] && \
+        warn "Some private IPs do not match source — fix the target subnet range (must mirror source) and re-run."
+
     ok "Post-failover network wiring complete"
 else
     info "  Skipping network wiring (--skip-wiring)"
