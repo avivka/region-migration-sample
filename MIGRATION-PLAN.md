@@ -4,7 +4,8 @@
 **Method:** Azure Site Recovery (A2A) continuous replication with planned failover
 **Tooling:** Scripts `01`–`05` in this repo (see [RUNBOOK.md](RUNBOOK.md))
 **Owner:** Aviv Kabesa
-**Status:** Draft — pending sign-off; **calendar dates TBD, to be aligned in the planning meeting**
+**Status:** **ARCHIVED 2026-08-31** (project paused — replication throughput; see [PROJECT-STATUS.md](PROJECT-STATUS.md)).
+Plan retained for revival; timeline is C-day relative, dates were never set.
 
 > Timeline notation: the plan spans **5 consecutive weeks** expressed as *Week N, Day N*
 > (Day 1 = Monday). Cutover-adjacent steps are anchored to **C = cutover day** (C−2d, C+3d, …).
