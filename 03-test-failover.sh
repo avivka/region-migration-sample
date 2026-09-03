@@ -116,21 +116,21 @@ SRC_FABRIC="fabric-${SOURCE_REGION}"
 SRC_CONTAINER="container-${SOURCE_REGION}"
 API_VERSION="2025-08-01"
 
-# Mirror source VNet/subnet names for the target (same defaults as script 01).
-if [[ -z "$TARGET_VNET" ]]; then
-    if [[ -n "$SOURCE_RG" ]]; then
-        TARGET_VNET=$(az network vnet list -g "$SOURCE_RG" --query "[0].name" -o tsv 2>/dev/null || true)
+# Mirror the source VNet/subnet of the FIRST VM's NIC (never "first vnet in the
+# RG" — multi-tenant RGs hold many VNets and [0] picks the wrong one).
+if [[ -n "$SOURCE_RG" && ( -z "$TARGET_VNET" || -z "$TARGET_SUBNET" ) ]]; then
+    _first_vm="$(echo "${VM_NAMES[0]}" | xargs)"
+    _nic_id=$(az vm show -g "$SOURCE_RG" -n "$_first_vm" \
+        --query "networkProfile.networkInterfaces[0].id" -o tsv 2>/dev/null || true)
+    _subnet_id=$(az network nic show --ids "$_nic_id" \
+        --query "ipConfigurations[0].subnet.id" -o tsv 2>/dev/null || true)
+    if [[ -n "$_subnet_id" ]]; then
+        [[ -z "$TARGET_VNET" ]] && TARGET_VNET=$(awk -F'/virtualNetworks/' '{print $2}' <<<"$_subnet_id" | awk -F'/' '{print $1}')
+        [[ -z "$TARGET_SUBNET" ]] && TARGET_SUBNET=$(awk -F'/subnets/' '{print $2}' <<<"$_subnet_id")
     fi
-    [[ -z "$TARGET_VNET" ]] && TARGET_VNET=$(az network vnet list -g "$TARGET_RG" --query "[0].name" -o tsv 2>/dev/null || true)
 fi
-if [[ -z "$TARGET_SUBNET" ]]; then
-    if [[ -n "$SOURCE_RG" ]]; then
-        TARGET_SUBNET=$(az network vnet subnet list -g "$SOURCE_RG" --vnet-name \
-            "$(az network vnet list -g "$SOURCE_RG" --query "[0].name" -o tsv 2>/dev/null)" \
-            --query "[0].name" -o tsv 2>/dev/null || true)
-    fi
-    [[ -z "$TARGET_SUBNET" ]] && TARGET_SUBNET="snet-workload"
-fi
+[[ -z "$TARGET_VNET" ]] && TARGET_VNET=$(az network vnet list -g "$TARGET_RG" --query "[0].name" -o tsv 2>/dev/null || true)
+[[ -z "$TARGET_SUBNET" ]] && TARGET_SUBNET="snet-workload"
 
 info "== Phase 3: Test Failover =="
 
@@ -182,6 +182,8 @@ TEST_NIC_NAMES=()
 TEST_NIC_VM_NAMES=()
 # Test PIP names chosen per VM (mirror source names) — reused by cleanup
 TEST_PIP_NAMES=()
+# Wanted exact source IPs per test VM (filled during PIP wiring, used by 3c)
+P_VMS=(); P_NICS=(); P_IPCS=(); P_WANT=()
 TEST_PIP_VM_NAMES=()
 
 all_done=false
@@ -290,37 +292,10 @@ for i in "${!VM_NAMES[@]}"; do
     ipconfig_name=$(az network nic show -g "$TARGET_RG" -n "$TEST_NIC_NAME" \
         --query "ipConfigurations[0].name" -o tsv)
 
-    # Pin the test VM to its EXACT source private IP. Azure does not persist a
-    # pre-set test-failover static IP (tfoStaticIPAddress is ignored), so ASR gives
-    # the test VM a DYNAMIC address (e.g. .6 instead of .4). We fix that here by
-    # setting the test NIC to Static = the source IP, then rebooting so the guest
-    # picks it up. The IP is free during a test (the real VM doesn't exist yet).
-    src_priv_ip=""
-    if [[ -n "$SOURCE_RG" ]]; then
-        src_priv_ip=$(az vm show -g "$SOURCE_RG" -n "$vm_name" -d \
-            --query "privateIps" -o tsv 2>/dev/null | awk -F, '{print $1}' | xargs || true)
-    fi
-    if [[ -n "$src_priv_ip" ]]; then
-        if az network nic ip-config update -g "$TARGET_RG" --nic-name "$TEST_NIC_NAME" \
-            -n "$ipconfig_name" --private-ip-address "$src_priv_ip" \
-            --public-ip-address "$TEST_PIP_NAME" -o none 2>/dev/null; then
-            got_ip=$(az network nic show -g "$TARGET_RG" -n "$TEST_NIC_NAME" \
-                --query "ipConfigurations[0].privateIPAddress" -o tsv 2>/dev/null)
-            if [[ "$got_ip" == "$src_priv_ip" ]]; then
-                ok "  $vm_name: test NIC pinned to source private IP $src_priv_ip"
-                info "    Rebooting $TEST_NIC_NAME's VM so the guest picks up $src_priv_ip..."
-                az vm restart -g "$TARGET_RG" -n "${vm_name}-test" --no-wait -o none 2>/dev/null || true
-            else
-                warn "  $vm_name: could not pin test IP to $src_priv_ip (got ${got_ip:-none}) — is it free in the subnet?"
-            fi
-        else
-            warn "  $vm_name: setting test NIC to $src_priv_ip failed (IP taken, or outside subnet) — left dynamic"
-        fi
-    else
-        # No source IP available — just attach the PIP with the dynamic IP.
-        az network nic ip-config update -g "$TARGET_RG" --nic-name "$TEST_NIC_NAME" \
-            -n "$ipconfig_name" --public-ip-address "$TEST_PIP_NAME" -o none
-    fi
+    # Attach the PIP now; exact private IPs are assigned together in the two-pass
+    # step below so sibling test NICs cannot occupy each other's source addresses.
+    az network nic ip-config update -g "$TARGET_RG" --nic-name "$TEST_NIC_NAME" \
+        -n "$ipconfig_name" --public-ip-address "$TEST_PIP_NAME" -o none
     ok "  $vm_name: PIP $TEST_PIP_NAME attached to $TEST_NIC_NAME"
 
     # Apply the source DNS label to the test PIP
@@ -347,7 +322,83 @@ for i in "${!VM_NAMES[@]}"; do
             -o none
         ok "  $vm_name: NSG $TEST_NSG_NAME attached to $TEST_NIC_NAME"
     fi
+
+    # Record wanted exact source IP for the two-pass assignment below.
+    if [[ -n "$SOURCE_RG" ]]; then
+        _sip=$(az network nic show --ids "$(az vm show -g "$SOURCE_RG" -n "$vm_name" \
+            --query "networkProfile.networkInterfaces[0].id" -o tsv 2>/dev/null)" -o json 2>/dev/null \
+            | jq -r '.ipConfigurations[0] | (.privateIPAddress // .privateIpAddress) // empty')
+        if [[ -n "$_sip" ]]; then
+            P_VMS+=("$vm_name"); P_NICS+=("$TEST_NIC_NAME"); P_IPCS+=("$ipconfig_name"); P_WANT+=("$_sip")
+        else
+            warn "  $vm_name: could not read source private IP — test IP left dynamic"
+        fi
+    fi
 done
+
+# ──────────── 3c. Set test VMs to their EXACT source private IPs ──
+# Sibling test VMs boot with dynamic IPs that can OCCUPY each other's wanted IPs
+# (001 wants .4 but 002's test VM took it). Two passes: park every wrong-IP NIC
+# on a free temp IP first, then claim the exact source IPs, then reboot so the
+# guests bind them. Destination private IP MUST equal source private IP.
+if [[ ${#P_VMS[@]} -gt 0 ]]; then
+    info "Setting test VMs to their exact source private IPs (two-pass)..."
+    tfo_reboot=""
+    # Drop entries already correct.
+    K_VMS=(); K_NICS=(); K_IPCS=(); K_WANT=()
+    for i in "${!P_VMS[@]}"; do
+        cur=$(az network nic show -g "$TARGET_RG" -n "${P_NICS[$i]}" \
+            --query "ipConfigurations[0].privateIPAddress" -o tsv 2>/dev/null)
+        if [[ "$cur" == "${P_WANT[$i]}" ]]; then
+            ok "  ${P_VMS[$i]}: already ${P_WANT[$i]}"
+        else
+            K_VMS+=("${P_VMS[$i]}"); K_NICS+=("${P_NICS[$i]}"); K_IPCS+=("${P_IPCS[$i]}"); K_WANT+=("${P_WANT[$i]}")
+        fi
+    done
+    if [[ ${#K_VMS[@]} -gt 0 ]]; then
+        # Pass 1: park on free temp IPs to release contested addresses.
+        for i in "${!K_VMS[@]}"; do
+            base=$(cut -d. -f1-3 <<<"${K_WANT[$i]}")
+            parked=""
+            for oct in $(seq 200 250); do
+                cand="${base}.${oct}"
+                avail=$(az network vnet check-ip-address -g "$TARGET_RG" -n "$TARGET_VNET" \
+                    --ip-address "$cand" --query available -o tsv 2>/dev/null || echo false)
+                [[ "$avail" == "true" ]] || continue
+                if az network nic ip-config update -g "$TARGET_RG" --nic-name "${K_NICS[$i]}" \
+                    -n "${K_IPCS[$i]}" --private-ip-address "$cand" -o none 2>/dev/null; then
+                    parked="$cand"; break
+                fi
+            done
+            [[ -n "$parked" ]] && detail "  ${K_VMS[$i]}: parked on $parked" \
+                || warn "  ${K_VMS[$i]}: could not park — will try direct assignment"
+        done
+        # Pass 2: claim the exact source IPs.
+        for i in "${!K_VMS[@]}"; do
+            if az network nic ip-config update -g "$TARGET_RG" --nic-name "${K_NICS[$i]}" \
+                -n "${K_IPCS[$i]}" --private-ip-address "${K_WANT[$i]}" -o none 2>/dev/null; then
+                ok "  ${K_VMS[$i]}: test private IP set to source ${K_WANT[$i]}"
+                tfo_reboot="$tfo_reboot ${K_VMS[$i]}"
+            else
+                warn "  ${K_VMS[$i]}: FAILED to set ${K_WANT[$i]} — subnet doesn't span it or an external NIC holds it."
+            fi
+        done
+        for vmn in $tfo_reboot; do
+            az vm restart -g "$TARGET_RG" -n "${vmn}-test" --no-wait -o none 2>/dev/null \
+                && detail "  ${vmn}-test: reboot issued so the guest binds its source IP" || true
+        done
+    fi
+    # Proof line per VM.
+    for i in "${!P_VMS[@]}"; do
+        d=$(az network nic show -g "$TARGET_RG" -n "${P_NICS[$i]}" \
+            --query "ipConfigurations[0].privateIPAddress" -o tsv 2>/dev/null)
+        if [[ "$d" == "${P_WANT[$i]}" ]]; then
+            ok "  ${P_VMS[$i]}: source=${P_WANT[$i]}  destination(test)=$d  MATCH"
+        else
+            warn "  ${P_VMS[$i]}: source=${P_WANT[$i]}  destination(test)=${d:-none}  MISMATCH"
+        fi
+    done
+fi
 
 # ──────────── 4. Print validation checklist ───────────────────
 echo ""

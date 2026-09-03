@@ -7,13 +7,13 @@
     "secureBoot": true,
     "vTPM": true,
     "diskController": "NVMe",
-    "osDiskSku": "Premium_LRS",
+    "osDiskSku": "null",
     "dataDisks": [
       {
         "name": "disk-data-vm-test-01",
         "lun": 0,
         "sizeGB": null,
-        "sku": "Premium_LRS"
+        "sku": null
       }
     ],
     "nics": [
@@ -49,13 +49,13 @@
     "secureBoot": true,
     "vTPM": true,
     "diskController": "NVMe",
-    "osDiskSku": "Premium_LRS",
+    "osDiskSku": "null",
     "dataDisks": [
       {
         "name": "disk-data-vm-test-02",
         "lun": 0,
         "sizeGB": null,
-        "sku": "PremiumV2_LRS"
+        "sku": null
       }
     ],
     "nics": [
@@ -91,13 +91,13 @@
     "secureBoot": true,
     "vTPM": true,
     "diskController": "NVMe",
-    "osDiskSku": "Premium_LRS",
+    "osDiskSku": "null",
     "dataDisks": [
       {
         "name": "disk-data-vm-test-03",
         "lun": 0,
         "sizeGB": null,
-        "sku": "Premium_LRS"
+        "sku": null
       }
     ],
     "nics": [

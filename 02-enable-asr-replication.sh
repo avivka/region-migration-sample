@@ -592,7 +592,9 @@ for vm_name in "${VM_NAMES[@]}"; do
     existing_state=$(az rest --method get --uri "$item_uri_existing" \
         --query "properties.protectionState" -o tsv 2>/dev/null || echo "")
     if [[ -n "$existing_state" ]]; then
-        if [[ "$existing_state" == *Failed* ]]; then
+        if [[ "$existing_state" == *Failed* || "$existing_state" == *Committed* || "$existing_state" == *Cancelled* ]]; then
+            # Failed enables AND completed/committed failovers must be purged before
+            # re-enabling — otherwise this script skips them and the sync poll hangs.
             warn "  $vm_name: found in $existing_state — purging to re-enable..."
             az rest --method delete --uri "$item_uri_existing" -o none 2>/dev/null || true
             for _ in $(seq 1 40); do
@@ -797,7 +799,6 @@ fi
 # stored on the item as staticIPAddress). tfo* fields do the same for test failover.
 # Requires the target subnet to contain that IP — script 01 mirrors the source range.
 info "Pinning recovery private IPs to match source (static assignment)..."
-PIN_FAILURES=""
 for vm_name in "${VM_NAMES[@]}"; do
     vm_name="$(echo "$vm_name" | xargs)"
     ITEM_NAME="asr-${vm_name}"
@@ -838,32 +839,28 @@ for vm_name in "${VM_NAMES[@]}"; do
 
     patch_body=$(jq -n --argjson nics "$nic_update" \
         '{properties: {providerSpecificDetails: {instanceType: "A2A"}, vmNics: $nics}}')
-
-    az rest --method patch --uri "$item_uri" --body "$patch_body" -o none 2>/dev/null \
-        || warn "  $vm_name: pin PATCH call failed — verifying result below"
-
-    # Read back what actually stuck — for BOTH planned (recovery) and test (tfo).
-    # ASR silently ignores a static IP outside the target subnet, leaving it Dynamic,
-    # which is exactly how a VM ends up on a foreign IP (10.x) or a shifted IP (.6
-    # instead of .4) after failover. Verify each and fail loud if either didn't take.
     want=$(echo "$nic_update" | jq -r '[.[].ipConfigs[].recoveryStaticIPAddress] | join(",")')
-    read_back() {
-        az rest --method get --uri "$item_uri" -o json 2>/dev/null \
-            | jq -r --arg f "$1" '[.properties.providerSpecificDetails.vmNics[]?.ipConfigs[]? | (.[$f] // "") | select(. != "")] | join(",")'
-    }
-    got_recovery=$(read_back recoveryStaticIPAddress)
-    if [[ "$got_recovery" == "$want" ]]; then
-        ok "  $vm_name: planned-failover IP pinned to source ($want). (Test-failover IP is set post-boot by script 03.)"
+
+    # Best-effort recovery-IP pin. The ASR PATCH is async and does NOT reliably
+    # persist recoveryStaticIPAddress (it silently drops it when the item is
+    # unhealthy or the IP is outside the mapped subnet). We DO NOT block on it —
+    # the exact private IP is authoritatively enforced post-failover by script 04
+    # (it sets the NIC to the source IP and reboots, the same method 03 uses for
+    # test failover). So a pin miss here is a note, never a hard error.
+    az rest --method patch --uri "$item_uri" --body "$patch_body" -o none 2>/dev/null || true
+    got=""
+    for _ in $(seq 1 6); do
+        sleep 10
+        got=$(az rest --method get --uri "$item_uri" -o json 2>/dev/null \
+            | jq -r '[.properties.providerSpecificDetails.vmNics[]?.ipConfigs[]? | (.recoveryStaticIPAddress // "") | select(. != "")] | join(",")')
+        [[ "$got" == "$want" ]] && break
+    done
+    if [[ "$got" == "$want" ]]; then
+        ok "  $vm_name: recovery private IP pre-pinned to source ($want)"
     else
-        warn "  $vm_name: planned-failover IP did NOT pin (wanted [$want], got [${got_recovery:-none}])."
-        warn "    Usually the target subnet does not contain that IP — confirm 01 mirrored the"
-        warn "    source range, and that the IP is FREE in the target subnet, then re-run."
-        PIN_FAILURES="${PIN_FAILURES} ${vm_name}"
+        detail "  $vm_name: recovery pin didn't persist (got [${got:-none}]) — the exact IP ($want) will be enforced after failover by script 04."
     fi
 done
-if [[ -n "${PIN_FAILURES// }" ]]; then
-    err "Recovery private IP could not be pinned for:${PIN_FAILURES}. These VMs would fail over to a FOREIGN private IP. Fix the target range and re-run before failover."
-fi
 
 # ──────────── Done ──────────────────────────────────────────────
 echo ""
